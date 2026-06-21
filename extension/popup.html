@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Google Meet Recorder</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <!-- Header -->
+  <header class="header">
+    <div class="header-left">
+      <!-- Mic Icon -->
+      <svg class="header-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/>
+        <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+        <line x1="12" y1="19" x2="12" y2="22"/>
+      </svg>
+      <span class="header-title">Google Meet Recorder</span>
+    </div>
+    <button class="header-settings" id="btnSettings" title="Settings">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="12" r="3"/>
+        <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1Z"/>
+      </svg>
+    </button>
+  </header>
+
+  <!-- Main Content -->
+  <main class="content" id="mainContent">
+    <!-- Recording Status Card -->
+    <div class="glass-card recording-card" id="recordingCard">
+      <div class="recording-status">
+        <div class="recording-dot" id="recordingDot"></div>
+        <span class="recording-label" id="recordingLabel">Not Recording</span>
+      </div>
+      <div class="recording-timer" id="recordingTimer">00:00:00</div>
+      <div class="recording-buttons" id="recordingButtons">
+        <button class="btn btn-primary" id="btnStart">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="12" r="10"/></svg>
+          Start Recording
+        </button>
+      </div>
+      <div class="error-text hidden" id="recordingError"></div>
+    </div>
+
+    <!-- WebSocket Status -->
+    <div>
+      <div class="section-header">
+        <h3 class="section-title">Connection Status</h3>
+      </div>
+      <div class="card-surface">
+        <div class="ws-status-row">
+          <div class="ws-dot" id="wsDot"></div>
+          <span class="ws-status-text" id="wsStatusText">Disconnected</span>
+        </div>
+        <div class="ws-url" id="wsUrl">ws://localhost:8080</div>
+        <div class="ws-metrics">
+          <span class="ws-latency" id="wsLatency">--ms</span>
+          <span class="ws-uptime" id="wsUptime">--:--:--</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Meeting Info -->
+    <div>
+      <div class="section-header">
+        <h3 class="section-title">Meeting Info</h3>
+      </div>
+      <div class="card-surface">
+        <div class="meeting-info-row">
+          <span class="meeting-info-label">Meeting ID:</span>
+          <span class="meeting-info-value" id="meetingId">--</span>
+        </div>
+        <div class="meeting-info-row">
+          <span class="meeting-info-label">Active:</span>
+          <span class="meeting-info-value highlight" id="activeCount">0</span>
+        </div>
+        <div class="meeting-info-row">
+          <span class="meeting-info-label">Total Joined:</span>
+          <span class="meeting-info-value" id="totalCount">0</span>
+        </div>
+        <div class="meeting-info-row">
+          <span class="meeting-info-label">Format:</span>
+          <span class="meeting-info-value">WebM (VP9 + Opus)</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Live Transcript -->
+    <div>
+      <div class="section-header">
+        <h3 class="section-title">Live Transcript</h3>
+        <span class="section-badge" id="transcriptBadge">0</span>
+      </div>
+      <div class="card-surface">
+        <div class="transcript-panel" id="transcriptPanel">
+          <div class="transcript-empty">Transcript will appear here when live captions are active</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Recent Activity -->
+    <div>
+      <div class="section-header">
+        <h3 class="section-title">Recent Activity</h3>
+        <span class="section-badge" id="activityBadge">0</span>
+      </div>
+      <div class="card-surface">
+        <div class="activity-log" id="activityLog">
+          <div class="activity-empty">Participant activity will appear here</div>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <!-- Settings Overlay -->
+  <div class="settings-overlay" id="settingsOverlay">
+    <div class="settings-header">
+      <h2 class="settings-title">Settings</h2>
+      <button class="settings-close" id="btnCloseSettings">&times;</button>
+    </div>
+    <div class="settings-body">
+      <div class="form-group">
+        <label class="form-label">WebSocket Server URL</label>
+        <input type="text" class="form-input" id="wsUrlInput" placeholder="ws://your-server:port" value="ws://localhost:8080">
+      </div>
+      <button class="btn btn-primary btn-full" id="btnSaveSettings">Save & Connect</button>
+      <div class="error-text hidden" id="settingsError"></div>
+      <div class="success-text hidden" id="settingsSuccess"></div>
+    </div>
+  </div>
+
+  <!-- Footer -->
+  <footer class="footer">
+    <span class="footer-text">v1.0.0 &bull; Google Meet Recorder</span>
+  </footer>
+
+  <script src="popup.js"></script>
+</body>
+</html>
