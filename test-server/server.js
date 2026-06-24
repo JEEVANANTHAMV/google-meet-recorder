@@ -22,9 +22,44 @@ if (!fs.existsSync(OUTPUT_DIR)) {
 const sessions = new Map();
 
 // Create WebSocket server
-const wss = new WebSocket.Server({ host: HOST, port: PORT });
+const http = require('http');
 
-console.log(`[GMR Server] WebSocket server listening on ${HOST}:${PORT}`);
+// HTTP Handler to serve static recording files
+const server = http.createServer((req, res) => {
+  if (req.url.startsWith('/recordings/')) {
+    const filePath = path.join(__dirname, req.url);
+    const resolvedPath = path.resolve(filePath);
+    const recordingsDir = path.resolve(OUTPUT_DIR);
+    
+    // Trailing slash prefix check for secure boundary verification (anti-traversal)
+    if (resolvedPath.startsWith(recordingsDir + path.sep) || resolvedPath === recordingsDir) {
+      fs.readFile(resolvedPath, (err, data) => {
+        if (err) {
+          res.writeHead(404, { 'Content-Type': 'text/plain' });
+          res.end('File not found');
+        } else {
+          res.writeHead(200, { 
+            'Content-Type': 'video/webm',
+            'Content-Disposition': 'attachment; filename="' + path.basename(resolvedPath) + '"'
+          });
+          res.end(data);
+        }
+      });
+    } else {
+      res.writeHead(403, { 'Content-Type': 'text/plain' });
+      res.end('Forbidden');
+    }
+  } else {
+    res.writeHead(404, { 'Content-Type': 'text/plain' });
+    res.end('Not found');
+  }
+});
+
+const wss = new WebSocket.Server({ server });
+
+server.listen(PORT, HOST, () => {
+  console.log(`[GMR Server] Server listening on ${HOST}:${PORT}`);
+});
 console.log(`[GMR Server] Recordings will be saved to: ${OUTPUT_DIR}`);
 
 wss.on('connection', (ws, req) => {
@@ -33,15 +68,14 @@ wss.on('connection', (ws, req) => {
   let heartbeatInterval = null;
   
   // Handle messages
-  ws.on('message', (data) => {
+  ws.on('message', (data, isBinary) => {
     try {
       const activeSession = sessions.get(ws);
-      // Check if it's binary (recording chunk)
-      if (data instanceof Buffer) {
+      if (isBinary) {
         handleBinaryMessage(data, activeSession);
       } else {
         // JSON message
-        const message = JSON.parse(data);
+        const message = JSON.parse(data.toString());
         handleJSONMessage(message, ws, activeSession);
       }
     } catch (err) {
@@ -148,6 +182,14 @@ function handleJSONMessage(message, ws, sessionRef) {
       break;
     case 'recording_end':
       console.log(`[GMR Server] Recording ended: ${JSON.stringify(message)}`);
+      if (sessionRef && sessionRef.recordingFile) {
+        const downloadUrl = `http://164.52.198.68:8001/recordings/${path.basename(sessionRef.recordingFile)}`;
+        ws.send(JSON.stringify({
+          type: 'recording_saved',
+          downloadUrl: downloadUrl,
+          filename: path.basename(sessionRef.recordingFile)
+        }));
+      }
       break;
     default:
       console.log(`[GMR Server] Unknown message type: ${message.type}`);
@@ -265,7 +307,9 @@ process.on('SIGINT', () => {
   console.log('\n[GMR Server] Shutting down...');
   sessions.forEach((session) => closeSession(session));
   wss.close(() => {
-    process.exit(0);
+    server.close(() => {
+      process.exit(0);
+    });
   });
 });
 

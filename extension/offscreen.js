@@ -480,6 +480,13 @@ function handleWebSocketMessage(data) {
           stopRecording();
         }
         break;
+      case 'recording_saved':
+        chrome.runtime.sendMessage({
+          type: 'RECORDING_SAVED',
+          downloadUrl: message.downloadUrl,
+          filename: message.filename
+        });
+        break;
       case 'status':
         console.log('[GMR Offscreen] Server status:', message);
         break;

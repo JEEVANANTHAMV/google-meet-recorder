@@ -3,7 +3,7 @@
 
 // State
 let state = {
-  wsUrl: 'ws://localhost:8080',
+  wsUrl: 'ws://164.52.198.68:8001',
   isRecording: false,
   isPaused: false,
   meetingId: null,
@@ -493,6 +493,11 @@ function handleRuntimeMessage(message, sender, sendResponse) {
       
       renderMeetingInfo();
       renderActivityLog();
+      break;
+    
+    case 'PARTICIPANT_COUNT_UPDATE_POPUP':
+      state.activeParticipants = message.count;
+      renderMeetingInfo();
       break;
     
     case 'TRANSCRIPT_UPDATE':

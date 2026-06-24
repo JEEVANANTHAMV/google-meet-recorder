@@ -7,7 +7,7 @@ let creatingOffscreen = false;
 // Initialize default settings on install
 chrome.runtime.onInstalled.addListener(() => {
   chrome.storage.local.set({
-    wsUrl: 'ws://localhost:8080',
+    wsUrl: 'ws://164.52.198.68:8001',
     isRecording: false,
     meetingId: null,
     recordingStartTime: null,
@@ -107,8 +107,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         case 'PARTICIPANT_EVENT':
           await handleParticipantEvent(message, sendResponse);
           break;
+        case 'PARTICIPANT_COUNT_UPDATE':
+          await handleParticipantCountUpdate(message, sendResponse);
+          break;
         case 'TRANSCRIPT_LINE':
           await handleTranscriptLine(message, sendResponse);
+          break;
+        case 'RECORDING_SAVED':
+          await handleRecordingSaved(message, sendResponse);
           break;
         case 'MEETING_DETECTED':
           await handleMeetingDetected(message, sender, sendResponse);
@@ -169,7 +175,7 @@ async function handleStartRecording(message, sendResponse) {
   // Send start command to offscreen
   const result = await sendToOffscreen({
     type: 'START_RECORDING',
-    wsUrl: data.wsUrl,
+    wsUrl: data.wsUrl || 'ws://164.52.198.68:8001',
     meetingId: data.meetingId
   });
   
@@ -178,7 +184,9 @@ async function handleStartRecording(message, sendResponse) {
       isRecording: true,
       recordingStartTime: Date.now(),
       transcriptLines: [],
-      activityLog: []
+      activityLog: [],
+      lastDownloadUrl: null,
+      lastFilename: null
     });
   }
   
@@ -217,6 +225,17 @@ async function handleUpdateSettings(message, sendResponse) {
   const updates = {};
   if (message.wsUrl) updates.wsUrl = message.wsUrl;
   await chrome.storage.local.set(updates);
+  sendResponse({ success: true });
+}
+
+// Handle participant count update from content script
+async function handleParticipantCountUpdate(message, sendResponse) {
+  const { count } = message;
+  await chrome.storage.local.set({ activeParticipants: count });
+  await broadcastToPopups({
+    type: 'PARTICIPANT_COUNT_UPDATE_POPUP',
+    count: count
+  });
   sendResponse({ success: true });
 }
 
@@ -326,6 +345,14 @@ async function handleRecordingStatus(message, sendResponse) {
     }
   }
   
+  sendResponse({ success: true });
+}
+
+// Handle recording saved from offscreen
+async function handleRecordingSaved(message, sendResponse) {
+  const { downloadUrl, filename } = message;
+  await chrome.storage.local.set({ lastDownloadUrl: downloadUrl, lastFilename: filename });
+  await broadcastToPopups({ type: 'RECORDING_SAVED_POPUP', downloadUrl, filename });
   sendResponse({ success: true });
 }
 
