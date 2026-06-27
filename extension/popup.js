@@ -137,12 +137,29 @@ async function handleStartRecording() {
   els.recordingError.classList.add('hidden');
   els.btnStart.disabled = true;
   els.btnStart.textContent = 'Starting...';
-  
+
   try {
-    const response = await sendMessage({ type: 'START_RECORDING' });
-    
+    // Acquire the tab-capture stream id HERE (the popup is a user-gesture context, which
+    // chrome.tabCapture requires) so we get clean tab audio with no screen-share picker.
+    let streamId = null;
+    try {
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (tab && /meet\.google\.com/.test(tab.url || '')) {
+        streamId = await new Promise((resolve, reject) => {
+          chrome.tabCapture.getMediaStreamId({ targetTabId: tab.id }, (id) => {
+            if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+            else resolve(id);
+          });
+        });
+      }
+    } catch (e) {
+      console.warn('[GMR Popup] tabCapture id failed, server will fall back:', e.message);
+    }
+
+    const response = await sendMessage({ type: 'START_RECORDING', streamId });
+
     if (response.error) {
-      els.recordingError.textContent = response.error;
+      els.recordingError.textContent = response.message || response.error;
       els.recordingError.classList.remove('hidden');
       els.btnStart.disabled = false;
       els.btnStart.innerHTML = `
@@ -215,22 +232,14 @@ async function handleResumeRecording() {
   }
 }
 
-// Request microphone permission for the extension. Granting here (a visible page) persists for the
-// whole extension origin, so the offscreen recorder can then capture and mix in the local voice.
-async function handleEnableMic() {
-  try {
-    els.btnEnableMic.disabled = true;
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    stream.getTracks().forEach(t => t.stop()); // we only needed the permission grant
-    await sendMessage({ type: 'UPDATE_SETTINGS', micEnabled: true });
-    state.micEnabled = true;
-    renderMicState();
-  } catch (err) {
-    els.btnEnableMic.disabled = false;
-    if (els.micHint) {
-      els.micHint.textContent = 'Microphone permission was blocked. Allow it in the site/extension settings to record your voice.';
-      els.micHint.style.color = '#ff9f0a';
-    }
+// Request microphone permission. The popup is too transient to reliably show Chrome's mic prompt,
+// so we open a dedicated full-page tab (permission.html) which prompts reliably. Granting there
+// persists for the whole extension origin, so the offscreen recorder can capture the local voice.
+function handleEnableMic() {
+  chrome.tabs.create({ url: chrome.runtime.getURL('permission.html') });
+  if (els.micHint) {
+    els.micHint.textContent = 'Opened a tab to grant microphone access — click Allow there, then come back.';
+    els.micHint.style.color = '';
   }
 }
 

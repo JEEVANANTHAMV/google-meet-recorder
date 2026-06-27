@@ -97,11 +97,15 @@ async function startRecording(serverUrl, mId, token, streamId, captureMic) {
       });
       console.log('[GMR Offscreen] Tab capture acquired');
     } else {
+      // Fallback: screen/window/tab share. systemAudio:'include' asks Chrome to capture the
+      // speaker/system audio for screen & window shares (supported on Windows/ChromeOS), and tab
+      // shares include tab audio by default — so "entire screen" sharing still records the audio.
       captureStream = await navigator.mediaDevices.getDisplayMedia({
-        video: { displaySurface: 'browser', width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 30 } },
-        audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, sampleRate: 48000, channelCount: 2 }
+        video: { width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 30 } },
+        audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, sampleRate: 48000, channelCount: 2 },
+        systemAudio: 'include'
       });
-      console.log('[GMR Offscreen] Display media acquired (fallback)');
+      console.log('[GMR Offscreen] Display media acquired (fallback). Audio tracks:', captureStream.getAudioTracks().length);
     }
 
     console.log('[GMR Offscreen] Capture tracks:', captureStream.getTracks().map(t => ({ kind: t.kind, label: t.label })));

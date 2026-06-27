@@ -22,6 +22,7 @@
   let lastReportedInMeeting = null;
   let captionsArmed = false;          // true once we've successfully enabled captions at least once
   let captionWarnCooldownUntil = 0;   // suppress duplicate "captions required" warnings
+  let lastPanelOpenAttempt = 0;       // rate-limit auto-opening the People panel
 
   // ===== Participant tracking: stable-identity cache + snapshot-diff engine =====
   // id -> { id, name, joinedAt, lastSeen, leftAt, missingSince }
@@ -64,12 +65,16 @@
     selfName: '[data-self-name]'
   };
 
-  // Strings that look like names but are actually Meet UI chrome — never treat these as participants.
+  // Strings that look like names but are actually Meet UI chrome / id-path words — never treat
+  // these as participant names.
   const UI_NOISE = new Set([
     'you', 'me', 'mic', 'camera', 'present', 'presenting', 'chat', 'people', 'raise hand',
     'more options', 'more', 'cc', 'captions', 'pin', 'pinned', 'unpin', 'remove', 'mute',
     'muted', 'unmute', 'host', 'co-host', 'meeting host', 'screen share', 'is presenting',
-    'turn off', 'turn on', 'add people', 'search for people', 'contributors', 'in this call'
+    'turn off', 'turn on', 'add people', 'search for people', 'contributors', 'in this call',
+    // words that come from data-participant-id paths ("spaces/<id>/devices/<n>") or panel status
+    'devices', 'spaces', 'device', 'space', 'guest', 'anonymous', 'calling', 'ringing',
+    'invited', 'waiting', 'joining', 'presentation', 'your presentation', 'meeting details'
   ]);
 
   // ==================== DOM CREATION HELPER ====================
@@ -717,52 +722,105 @@
     return !!micBtn;
   }
 
-  // Build a Map<identity, name> of everyone currently rendered in the call.
+  // Build a Map<normalizedName, displayName> of everyone currently in the call.
+  //
+  // Identity is the PERSON'S NAME, not Meet's data-participant-id. Meet's ids look like
+  // "spaces/<id>/devices/<n>" and the <n> churns on every rejoin / transient tile, which is what
+  // inflated the count (4 instead of 2) and produced junk names like "devices". Keying on the name
+  // collapses rejoins and duplicate tiles to one person and gives a correct unique total.
   function snapshotParticipants() {
-    const found = new Map();
-
-    const add = (id, name) => {
-      if (!id) return;
-      const clean = name ? cleanName(name) : null;
-      const prev = found.get(id);
-      // Keep the best name we can find for this identity across all its DOM appearances.
-      if (prev === undefined || (clean && (!prev || prev === 'Guest'))) {
-        found.set(id, clean || prev || 'Guest');
-      }
+    const found = new Map(); // normName -> displayName
+    const addName = (raw) => {
+      const disp = cleanName(raw);
+      if (!disp || !isPlausibleName(disp)) return;
+      const norm = disp.toLowerCase();
+      if (!found.has(norm)) found.set(norm, disp);
     };
 
-    // Strategy 1+2: every element that carries a stable data-participant-id (video tiles AND the
-    // people-panel rows). This is the single most reliable hook in Google Meet.
-    document.querySelectorAll(SELECTORS.participantId).forEach(el => {
-      add(el.getAttribute('data-participant-id'), extractNameFromContainer(el));
-    });
-
-    // Strategy 3: the local user. The self tile usually ALSO carries a data-participant-id (so it
-    // is already counted above), so only add a synthetic self identity if that name isn't present
-    // yet — otherwise we'd double-count ourselves and inflate the active count.
-    const selfEl = document.querySelector(SELECTORS.selfName);
-    if (selfEl) {
-      const selfName = cleanName(selfEl.getAttribute('data-self-name'));
-      if (selfName) {
-        const alreadyPresent = Array.from(found.values())
-          .some(n => n && n.toLowerCase() === selfName.toLowerCase());
-        if (!alreadyPresent) add('self:' + selfName.toLowerCase(), selfName);
-      }
+    // PRIMARY: the People panel lists each participant exactly once, with their real name.
+    const panelNames = readPeoplePanel();
+    if (panelNames && panelNames.length) {
+      panelNames.forEach(addName);
+    } else {
+      // FALLBACK (panel not open/readable): derive names from video tiles. Less reliable, so we
+      // try hard to extract a real name and skip tiles we can't name confidently.
+      document.querySelectorAll('[data-participant-id]').forEach(el => addName(extractNameFromContainer(el)));
     }
 
-    // Strategy 4 (fallback only): if Meet ever drops data-participant-id, fall back to the
-    // accessible people list so tracking still degrades gracefully instead of breaking.
-    if (found.size === 0) {
-      document.querySelectorAll('[role="list"] [role="listitem"]').forEach(el => {
-        const name = cleanName(el.getAttribute('aria-label') || extractNameFromContainer(el));
-        if (name) add('name:' + name.toLowerCase(), name);
-      });
-    }
+    // ALWAYS include the local user — data-self-name is authoritative.
+    addName(getSelfName());
 
     return found;
   }
 
-  // Pull the most name-like string out of a participant container (a tile or list row).
+  function getSelfName() {
+    const el = document.querySelector('[data-self-name]');
+    return el ? cleanName(el.getAttribute('data-self-name')) : null;
+  }
+
+  // Locate the People / participants side panel container (where names are listed cleanly).
+  function findPeoplePanelContainer() {
+    const nodes = document.querySelectorAll(
+      '[role="region"], [role="dialog"], [role="complementary"], [role="list"]'
+    );
+    for (const n of nodes) {
+      const label = (n.getAttribute('aria-label') || '').toLowerCase();
+      if (/people|participant|contributor/.test(label) && n.querySelector('[role="listitem"]')) {
+        return n;
+      }
+    }
+    return null;
+  }
+
+  // Open the People panel if it isn't already, so we can read authoritative names. Rate-limited so
+  // we don't fight a user who deliberately closes it.
+  function ensurePeoplePanelOpen() {
+    if (findPeoplePanelContainer()) return;
+    const now = Date.now();
+    if (now - lastPanelOpenAttempt < 30000) return;
+    lastPanelOpenAttempt = now;
+    const btns = document.querySelectorAll('button[aria-label], [role="button"][aria-label]');
+    for (const b of btns) {
+      const l = (b.getAttribute('aria-label') || '').toLowerCase();
+      if (/add people|add others|add to/.test(l)) continue;       // not the "add" button
+      if (/people|show everyone|participant|contributor/.test(l)) { b.click(); return; }
+    }
+  }
+
+  // Read participant names from the People panel. Returns an array of display names, or null.
+  function readPeoplePanel() {
+    const container = findPeoplePanelContainer();
+    if (!container) return null;
+    const items = container.querySelectorAll('[role="listitem"]');
+    if (!items.length) return null;
+    const names = [];
+    items.forEach(item => {
+      const nm = extractPanelName(item);
+      if (nm) names.push(nm);
+    });
+    return names.length ? names : null;
+  }
+
+  // Extract one participant's name from a People-panel row.
+  function extractPanelName(item) {
+    // The row's aria-label is usually the participant's name (e.g. "Jane Doe", "Jane Doe (You)").
+    const label = cleanName(item.getAttribute('aria-label'));
+    if (label && isPlausibleName(label)) return label;
+    // Otherwise the most prominent text. In a panel row the name is the longest plain string;
+    // status words ("Host", "Muted") are short and filtered out by isPlausibleName / UI_NOISE.
+    const candidates = [];
+    item.querySelectorAll('*').forEach(node => {
+      if (node.children.length === 0) {
+        const c = cleanName(node.textContent);
+        if (c && isPlausibleName(c)) candidates.push(c);
+      }
+    });
+    if (!candidates.length) return null;
+    candidates.sort((a, b) => b.length - a.length); // prefer the full name
+    return candidates[0];
+  }
+
+  // Fallback name extraction from a video tile (only used when the People panel is unavailable).
   function extractNameFromContainer(el) {
     if (!el) return null;
 
@@ -770,26 +828,21 @@
     let selfHost = (el.getAttribute && el.getAttribute('data-self-name')) ? el : null;
     if (!selfHost && el.querySelector) selfHost = el.querySelector('[data-self-name]');
     if (selfHost) {
-      const selfName = selfHost.getAttribute('data-self-name');
+      const selfName = cleanName(selfHost.getAttribute('data-self-name'));
       if (selfName && isPlausibleName(selfName)) return selfName;
     }
 
-    // Collect candidate strings from leaf elements (the name overlay is a leaf text node).
     const candidates = [];
-    const pushCandidate = (t) => { if (t && isPlausibleName(t)) candidates.push(t.trim()); };
-
+    const pushCandidate = (t) => { const c = cleanName(t); if (c && isPlausibleName(c)) candidates.push(c); };
     if (el.querySelectorAll) {
       el.querySelectorAll('*').forEach(node => {
         if (node.children.length === 0) pushCandidate(node.textContent);
-        const aria = node.getAttribute && node.getAttribute('aria-label');
-        if (aria) pushCandidate(aria);
       });
     }
-    pushCandidate(el.getAttribute && el.getAttribute('aria-label'));
-
     if (candidates.length === 0) return null;
-    // Names are short; longer strings tend to be captions/labels. Prefer the shortest plausible one.
-    candidates.sort((a, b) => a.length - b.length);
+    // Prefer the longest plausible string — a real display name ("Poonthamil V") beats stray
+    // short words. (The old "shortest" rule wrongly picked junk like "devices".)
+    candidates.sort((a, b) => b.length - a.length);
     return candidates[0];
   }
 
@@ -830,6 +883,9 @@
       return;
     }
     wasInCall = true;
+
+    // Make sure the People panel is available so we can read real names (rate-limited).
+    ensurePeoplePanelOpen();
 
     const snapshot = snapshotParticipants();
     const now = Date.now();

@@ -171,20 +171,33 @@ async function handleStartRecording(message, sendResponse) {
     return;
   }
 
-  // #3: Acquire a tab-capture stream id so the offscreen doc can grab tab AUDIO + video reliably
-  // (no screen-share picker, and audio of all participants is included). Falls back to display capture.
-  let streamId = null;
-  if (data.recordedTabId != null) {
-    try {
-      streamId = await new Promise((resolve, reject) => {
-        chrome.tabCapture.getMediaStreamId({ targetTabId: data.recordedTabId }, (id) => {
-          if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
-          else resolve(id);
+  // #3: Tab-capture stream id so the offscreen doc can grab tab AUDIO + video reliably (no picker,
+  // all participants' audio included). The popup acquires this in its gesture context and passes it
+  // here (most reliable). If absent (e.g. started from the in-page panel), try from the worker.
+  let streamId = message.streamId || null;
+  if (streamId) {
+    console.log('[GMR] Using tabCapture stream id from popup');
+  } else {
+    let targetTabId = data.recordedTabId;
+    if (targetTabId == null) {
+      try {
+        const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+        if (tabs[0] && /meet\.google\.com/.test(tabs[0].url || '')) targetTabId = tabs[0].id;
+      } catch (e) { /* ignore */ }
+    }
+    if (targetTabId != null) {
+      try {
+        streamId = await new Promise((resolve, reject) => {
+          chrome.tabCapture.getMediaStreamId({ targetTabId }, (id) => {
+            if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+            else resolve(id);
+          });
         });
-      });
-      console.log('[GMR] tabCapture stream id acquired');
-    } catch (err) {
-      console.warn('[GMR] getMediaStreamId failed, falling back to display capture:', err.message);
+        console.log('[GMR] tabCapture stream id acquired (worker)');
+      } catch (err) {
+        console.warn('[GMR] getMediaStreamId from worker failed; will fall back to display capture. ' +
+          'Tip: start from the extension popup for clean tab audio. Reason:', err.message);
+      }
     }
   }
 
