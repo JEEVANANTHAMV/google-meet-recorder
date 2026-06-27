@@ -160,13 +160,32 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 // Start recording handler
 async function handleStartRecording(message, sendResponse) {
   console.log('[GMR] Starting recording...');
-  
-  // Get meeting info from storage
-  const data = await chrome.storage.local.get(['meetingId', 'wsUrl', 'wsAuthToken']);
 
-  if (!data.meetingId) {
-    sendResponse({ error: 'No active meeting detected. Join a Google Meet first.' });
+  // Get meeting info from storage
+  const data = await chrome.storage.local.get(['meetingId', 'wsUrl', 'wsAuthToken', 'recordedTabId', 'inMeeting', 'micEnabled']);
+
+  // #1: Only record once the user is actually INSIDE the call (not the lobby/green room).
+  // Bail out before creating any session / offscreen doc / WebSocket.
+  if (!data.meetingId || !data.inMeeting) {
+    sendResponse({ error: 'NOT_IN_MEETING', message: 'You are not inside the meeting yet. Please join the meeting and then click Record.' });
     return;
+  }
+
+  // #3: Acquire a tab-capture stream id so the offscreen doc can grab tab AUDIO + video reliably
+  // (no screen-share picker, and audio of all participants is included). Falls back to display capture.
+  let streamId = null;
+  if (data.recordedTabId != null) {
+    try {
+      streamId = await new Promise((resolve, reject) => {
+        chrome.tabCapture.getMediaStreamId({ targetTabId: data.recordedTabId }, (id) => {
+          if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+          else resolve(id);
+        });
+      });
+      console.log('[GMR] tabCapture stream id acquired');
+    } catch (err) {
+      console.warn('[GMR] getMediaStreamId failed, falling back to display capture:', err.message);
+    }
   }
 
   // Setup offscreen document for recording
@@ -177,9 +196,11 @@ async function handleStartRecording(message, sendResponse) {
     type: 'START_RECORDING',
     wsUrl: data.wsUrl || 'ws://164.52.198.68:8001',
     meetingId: data.meetingId,
-    authToken: data.wsAuthToken || null
+    authToken: data.wsAuthToken || null,
+    streamId,
+    captureMic: data.micEnabled === true
   });
-  
+
   if (result.success) {
     await chrome.storage.local.set({
       isRecording: true,
@@ -227,7 +248,7 @@ async function handleGetState(sendResponse) {
   const data = await chrome.storage.local.get([
     'wsUrl', 'isRecording', 'meetingId', 'recordingStartTime',
     'totalParticipants', 'activeParticipants', 'transcriptLines',
-    'activityLog', 'wsConnected', 'wsLatency'
+    'activityLog', 'wsConnected', 'wsLatency', 'micEnabled'
   ]);
   sendResponse({ success: true, state: data });
 }
@@ -236,6 +257,7 @@ async function handleGetState(sendResponse) {
 async function handleUpdateSettings(message, sendResponse) {
   const updates = {};
   if (message.wsUrl) updates.wsUrl = message.wsUrl;
+  if (typeof message.micEnabled === 'boolean') updates.micEnabled = message.micEnabled;
   await chrome.storage.local.set(updates);
   sendResponse({ success: true });
 }
@@ -335,12 +357,22 @@ async function handleMeetingDetected(message, sender, sendResponse) {
 async function handleRecordingStatus(message, sendResponse) {
   const { status, duration, error, audioMissing } = message;
   console.log('[GMR] Recording status:', status, 'audioMissing:', !!audioMissing);
-  
-  await chrome.storage.local.set({
-    isRecording: status === 'recording',
-    recordingError: error || null
-  });
-  
+
+  // #2: A 'paused' status must NOT clear isRecording — otherwise pause looks like a full stop
+  // (UI resets, participant/transcript streaming halts). Only 'stopped' ends the recording.
+  const updates = { recordingError: error || null };
+  if (status === 'recording') {
+    updates.isRecording = true;
+    updates.isPaused = false;
+  } else if (status === 'paused') {
+    updates.isRecording = true;
+    updates.isPaused = true;
+  } else if (status === 'stopped') {
+    updates.isRecording = false;
+    updates.isPaused = false;
+  }
+  await chrome.storage.local.set(updates);
+
   await broadcastToPopups({ type: 'RECORDING_UPDATE', status, duration, error });
   
   if (audioMissing) {

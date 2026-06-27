@@ -14,7 +14,8 @@ let state = {
   wsLatency: 0,
   transcriptLines: [],
   activityLog: [],
-  recordingError: null
+  recordingError: null,
+  micEnabled: false
 };
 
 // Timer interval
@@ -73,6 +74,8 @@ function cacheElements() {
   els.activityBadge = document.getElementById('activityBadge');
   
   els.btnStart = document.getElementById('btnStart');
+  els.btnEnableMic = document.getElementById('btnEnableMic');
+  els.micHint = document.getElementById('micHint');
   els.btnSettings = document.getElementById('btnSettings');
   els.settingsOverlay = document.getElementById('settingsOverlay');
   els.btnCloseSettings = document.getElementById('btnCloseSettings');
@@ -85,6 +88,9 @@ function cacheElements() {
 function setupEventListeners() {
   // Start recording
   els.btnStart.addEventListener('click', handleStartRecording);
+
+  // Enable microphone capture (the permission prompt can only appear here, not in offscreen)
+  if (els.btnEnableMic) els.btnEnableMic.addEventListener('click', handleEnableMic);
   
   // Settings
   els.btnSettings.addEventListener('click', () => {
@@ -209,6 +215,36 @@ async function handleResumeRecording() {
   }
 }
 
+// Request microphone permission for the extension. Granting here (a visible page) persists for the
+// whole extension origin, so the offscreen recorder can then capture and mix in the local voice.
+async function handleEnableMic() {
+  try {
+    els.btnEnableMic.disabled = true;
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    stream.getTracks().forEach(t => t.stop()); // we only needed the permission grant
+    await sendMessage({ type: 'UPDATE_SETTINGS', micEnabled: true });
+    state.micEnabled = true;
+    renderMicState();
+  } catch (err) {
+    els.btnEnableMic.disabled = false;
+    if (els.micHint) {
+      els.micHint.textContent = 'Microphone permission was blocked. Allow it in the site/extension settings to record your voice.';
+      els.micHint.style.color = '#ff9f0a';
+    }
+  }
+}
+
+function renderMicState() {
+  if (!els.btnEnableMic) return;
+  if (state.micEnabled) {
+    els.btnEnableMic.textContent = '🎤 My mic is enabled';
+    els.btnEnableMic.disabled = true;
+    els.btnEnableMic.classList.remove('btn-secondary');
+    els.btnEnableMic.classList.add('btn-primary');
+    if (els.micHint) els.micHint.textContent = 'Your voice + all participants will be recorded.';
+  }
+}
+
 async function handleSaveSettings() {
   const url = els.wsUrlInput.value.trim();
   
@@ -254,6 +290,7 @@ function renderAll() {
   renderMeetingInfo();
   renderTranscript();
   renderActivityLog();
+  renderMicState();
 }
 
 function renderRecordingCard() {
@@ -275,35 +312,25 @@ function renderRecordingCard() {
         <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="4" width="4" height="16" rx="1"/><rect x="14" y="4" width="4" height="16" rx="1"/></svg>
         Pause
       </button>
-      <button class="btn btn-danger" id="btnStop">
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="4" width="16" height="16" rx="2"/></svg>
-        Stop
-      </button>
     `;
-    
+
     document.getElementById('btnPause').addEventListener('click', handlePauseRecording);
-    document.getElementById('btnStop').addEventListener('click', handleStopRecording);
-    
+
   } else if (state.isRecording && state.isPaused) {
     // Paused
     els.recordingCard.classList.add('paused');
     els.recordingLabel.textContent = 'Paused';
     els.recordingTimer.classList.add('paused');
-    
+
     els.recordingButtons.innerHTML = `
       <button class="btn btn-primary" id="btnResume">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>
         Resume
       </button>
-      <button class="btn btn-danger" id="btnStop">
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="4" width="16" height="16" rx="2"/></svg>
-        Stop
-      </button>
     `;
-    
+
     document.getElementById('btnResume').addEventListener('click', handleResumeRecording);
-    document.getElementById('btnStop').addEventListener('click', handleStopRecording);
-    
+
   } else {
     // Idle
     els.recordingLabel.textContent = 'Not Recording';

@@ -13,7 +13,10 @@ let reconnectTimer = null;
 let heartbeatTimer = null;
 let pingTime = 0;
 let isPaused = false;
-let stream = null;
+let stream = null;          // the stream handed to MediaRecorder (tab video + mixed audio)
+let captureStream = null;   // raw tab/display capture stream
+let micStream = null;       // local microphone (best-effort, for the local speaker's voice)
+let playbackContext = null; // AudioContext that mixes audio + replays meeting audio to the user
 
 // Message handler from background script
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -23,7 +26,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     try {
       switch (message.type) {
         case 'START_RECORDING':
-          await startRecording(message.wsUrl, message.meetingId, message.authToken);
+          await startRecording(message.wsUrl, message.meetingId, message.authToken, message.streamId, message.captureMic);
           sendResponse({ success: true });
           break;
         case 'STOP_RECORDING':
@@ -73,62 +76,68 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   return true;
 });
 
-// Start recording with display media
-async function startRecording(serverUrl, mId, token) {
+// Start recording. Prefers chrome.tabCapture (reliable tab audio = all participants); falls
+// back to getDisplayMedia if no stream id was provided.
+async function startRecording(serverUrl, mId, token, streamId, captureMic) {
   wsUrl = serverUrl;
   meetingId = mId;
   authToken = token || null;
-  
-  console.log('[GMR Offscreen] Starting recording for meeting:', meetingId);
-  console.log('[GMR Offscreen] WebSocket URL:', wsUrl);
-  
+
+  console.log('[GMR Offscreen] Starting recording for meeting:', meetingId, '| tabCapture:', !!streamId, '| mic:', !!captureMic);
+
   // Connect to WebSocket first
   await connectWebSocket();
-  
+
   try {
-    // Request display media with audio
-    stream = await navigator.mediaDevices.getDisplayMedia({
-      video: {
-        displaySurface: 'browser',
-        width: { ideal: 1920 },
-        height: { ideal: 1080 },
-        frameRate: { ideal: 30 }
-      },
-      audio: {
-        echoCancellation: false,
-        noiseSuppression: false,
-        autoGainControl: false,
-        sampleRate: 48000,
-        channelCount: 2
-      }
-    });
-    
-    console.log('[GMR Offscreen] Display media acquired');
-    console.log('[GMR Offscreen] Tracks:', stream.getTracks().map(t => ({ kind: t.kind, label: t.label, enabled: t.enabled })));
-    
-    // Check if audio track exists and is active
-    const audioTracks = stream.getAudioTracks();
-    const hasAudio = audioTracks.length > 0 && audioTracks[0].enabled;
-    
-    if (!hasAudio) {
-      console.warn('[GMR Offscreen] No audio track detected!');
-      // Notify background about missing audio
-      chrome.runtime.sendMessage({
-        type: 'RECORDING_STATUS',
-        status: 'recording',
-        audioMissing: true
+    // 1) Acquire the capture stream (tab capture preferred).
+    if (streamId) {
+      captureStream = await navigator.mediaDevices.getUserMedia({
+        audio: { mandatory: { chromeMediaSource: 'tab', chromeMediaSourceId: streamId } },
+        video: { mandatory: { chromeMediaSource: 'tab', chromeMediaSourceId: streamId } }
       });
+      console.log('[GMR Offscreen] Tab capture acquired');
     } else {
-      // Monitor audio volume to detect if it's actually capturing
+      captureStream = await navigator.mediaDevices.getDisplayMedia({
+        video: { displaySurface: 'browser', width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 30 } },
+        audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, sampleRate: 48000, channelCount: 2 }
+      });
+      console.log('[GMR Offscreen] Display media acquired (fallback)');
+    }
+
+    console.log('[GMR Offscreen] Capture tracks:', captureStream.getTracks().map(t => ({ kind: t.kind, label: t.label })));
+
+    // 2) Optionally also capture the local microphone so the LOCAL speaker's voice is recorded
+    //    (tab audio only contains the *remote* participants — Meet never echoes your own mic).
+    //    Requires extension mic permission, granted via the popup's "Enable my mic" button; the
+    //    prompt cannot appear in an offscreen document.
+    micStream = null;
+    if (captureMic) {
+      try {
+        micStream = await navigator.mediaDevices.getUserMedia({
+          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+        });
+        console.log('[GMR Offscreen] Microphone acquired (local voice will be mixed in)');
+      } catch (micErr) {
+        console.warn('[GMR Offscreen] Mic enabled but unavailable, recording tab audio only:', micErr.message);
+      }
+    }
+
+    // 3) Build the recording stream: tab video + audio (tab audio = all participants, mixed with
+    //    mic if available), and replay meeting audio so tab capture doesn't mute the user's speakers.
+    stream = await buildRecordingStream(captureStream, micStream);
+
+    const audioTracks = stream.getAudioTracks();
+    if (audioTracks.length === 0) {
+      console.warn('[GMR Offscreen] No audio track in recording stream!');
+      chrome.runtime.sendMessage({ type: 'RECORDING_STATUS', status: 'recording', audioMissing: true });
+    } else {
       monitorAudioVolume(audioTracks[0]);
     }
-    
-    // Handle stream end (user clicks "Stop sharing")
-    stream.getVideoTracks()[0].onended = () => {
-      console.log('[GMR Offscreen] Stream ended by user');
-      stopRecording();
-    };
-    
+
+    // Handle capture end (tab closed / "Stop sharing")
+    const vTrack = captureStream.getVideoTracks()[0];
+    if (vTrack) vTrack.onended = () => { console.log('[GMR Offscreen] Capture ended'); stopRecording(); };
+
     // Create MediaRecorder
     const mimeType = getSupportedMimeType();
     console.log('[GMR Offscreen] Using MIME type:', mimeType);
@@ -187,27 +196,87 @@ async function startRecording(serverUrl, mId, token) {
   }
 }
 
+// Mix capture audio (all remote participants) + microphone (local voice) into a single track,
+// and replay the meeting audio to the user so tab capture doesn't silence their speakers.
+async function buildRecordingStream(capture, mic) {
+  const videoTracks = capture.getVideoTracks();
+  const tabAudio = capture.getAudioTracks();
+  const micAudio = mic ? mic.getAudioTracks() : [];
+
+  console.log('[GMR Offscreen] Audio sources -> tab:', tabAudio.length, 'mic:', micAudio.length);
+
+  // No audio at all.
+  if (tabAudio.length === 0 && micAudio.length === 0) {
+    chrome.runtime.sendMessage({ type: 'RECORDING_STATUS', status: 'recording', audioMissing: true });
+    return new MediaStream(videoTracks);
+  }
+
+  // tabCapture mutes the live tab, so we must replay tab audio back to the user. The AudioContext
+  // can start SUSPENDED in an offscreen doc -> resume() is essential or the graph outputs silence.
+  // CASE A — no mic: record the RAW tab audio track (bulletproof: never affected by context state)
+  // and use a context only to replay audio to the user.
+  if (micAudio.length === 0) {
+    try {
+      playbackContext = new AudioContext();
+      await playbackContext.resume();
+      const tabSrc = playbackContext.createMediaStreamSource(new MediaStream(tabAudio));
+      tabSrc.connect(playbackContext.destination); // user keeps hearing the meeting
+    } catch (err) {
+      console.warn('[GMR Offscreen] Playback passthrough failed (recording still has audio):', err.message);
+    }
+    return new MediaStream([...videoTracks, ...tabAudio]);
+  }
+
+  // CASE B — mic present: mix tab + mic into one recorded track (and replay tab audio to the user).
+  try {
+    playbackContext = new AudioContext();
+    await playbackContext.resume();
+    const dest = playbackContext.createMediaStreamDestination();
+
+    if (tabAudio.length > 0) {
+      const tabSrc = playbackContext.createMediaStreamSource(new MediaStream(tabAudio));
+      tabSrc.connect(dest);                       // -> recorded
+      tabSrc.connect(playbackContext.destination); // -> user hears the meeting
+    }
+    const micSrc = playbackContext.createMediaStreamSource(new MediaStream(micAudio));
+    micSrc.connect(dest);                          // -> recorded only (no echo)
+
+    return new MediaStream([...videoTracks, ...dest.stream.getAudioTracks()]);
+  } catch (err) {
+    console.warn('[GMR Offscreen] Audio mixing failed, recording raw tab+mic:', err.message);
+    return new MediaStream([...videoTracks, ...tabAudio, ...micAudio]);
+  }
+}
+
 // Stop recording
 async function stopRecording() {
   console.log('[GMR Offscreen] Stopping recording...');
-  
+
   stopDurationReporting();
-  
+
   if (mediaRecorder && mediaRecorder.state !== 'inactive') {
     mediaRecorder.stop();
   }
-  
-  // Stop all tracks
-  if (stream) {
-    stream.getTracks().forEach(track => track.stop());
-    stream = null;
+
+  // Stop all tracks across every stream we opened.
+  [stream, captureStream, micStream].forEach(s => {
+    if (s) s.getTracks().forEach(track => track.stop());
+  });
+  stream = null;
+  captureStream = null;
+  micStream = null;
+
+  // Tear down the audio mixing/playback graph.
+  if (playbackContext) {
+    try { playbackContext.close(); } catch (e) { /* ignore */ }
+    playbackContext = null;
   }
-  
+
   // Close WebSocket
   closeWebSocket();
-  
+
   recordingStartTime = null;
-  
+
   chrome.runtime.sendMessage({
     type: 'RECORDING_STATUS',
     status: 'stopped',
@@ -301,7 +370,8 @@ function sendRecordingEnd() {
   });
 }
 
-// Monitor audio volume to detect silent/missing audio
+// Monitor audio level for diagnostics only. With tab capture an audio track is always present,
+// and a quiet moment is NOT "missing audio", so we only log here (no misleading user warning).
 function monitorAudioVolume(audioTrack) {
   try {
     const audioContext = new AudioContext();
@@ -309,30 +379,26 @@ function monitorAudioVolume(audioTrack) {
     const analyser = audioContext.createAnalyser();
     analyser.fftSize = 256;
     source.connect(analyser);
-    
+
     const dataArray = new Uint8Array(analyser.frequencyBinCount);
-    
+    let silentTicks = 0;
+
     const checkVolume = () => {
       if (!mediaRecorder || mediaRecorder.state === 'inactive') {
         audioContext.close();
         return;
       }
-      
+
       analyser.getByteFrequencyData(dataArray);
       const average = dataArray.reduce((a, b) => a + b) / dataArray.length;
-      
-      // If average volume is near zero for a while, audio might not be shared
-      if (average < 1) {
-        chrome.runtime.sendMessage({
-          type: 'RECORDING_STATUS',
-          status: 'recording',
-          audioMissing: true
-        });
+      silentTicks = average < 1 ? silentTicks + 1 : 0;
+      if (silentTicks === 15) {
+        console.warn('[GMR Offscreen] Audio has been silent for ~30s (no one speaking, or audio not captured)');
       }
-      
+
       setTimeout(checkVolume, 2000);
     };
-    
+
     checkVolume();
   } catch (err) {
     console.warn('[GMR Offscreen] Audio monitoring failed:', err);

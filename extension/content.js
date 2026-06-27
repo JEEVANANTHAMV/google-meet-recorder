@@ -19,6 +19,9 @@
   let lastSentActiveCount = null;
   let lastSentTotalCount = null;
   let wasInCall = false;
+  let lastReportedInMeeting = null;
+  let captionsArmed = false;          // true once we've successfully enabled captions at least once
+  let captionWarnCooldownUntil = 0;   // suppress duplicate "captions required" warnings
 
   // ===== Participant tracking: stable-identity cache + snapshot-diff engine =====
   // id -> { id, name, joinedAt, lastSeen, leftAt, missingSince }
@@ -142,6 +145,7 @@
       autoEnableCaptions();
       reconcileParticipants();
       checkMeetingEnded();
+      updateReminders();
     }, RECONCILE_INTERVAL_MS);
 
     // Run one reconcile pass immediately so we don't wait for the first interval tick.
@@ -475,12 +479,21 @@
 
   function handleRecordButtonClick() {
     chrome.storage.local.get(['isRecording'], (data) => {
-      if (data.isRecording) {
-        chrome.runtime.sendMessage({ type: 'STOP_RECORDING' });
-      } else {
-        autoEnableCaptions();
-        chrome.runtime.sendMessage({ type: 'START_RECORDING' });
+      if (data.isRecording) return; // recording is stopped automatically when the meeting ends
+
+      // #1: refuse to start (and never create a server session) until actually inside the call.
+      if (!isInCall()) {
+        showToast('You are not inside the meeting yet. Please join the meeting and then click Record.', 'warn');
+        return;
       }
+      autoEnableCaptions();
+      chrome.runtime.sendMessage({ type: 'START_RECORDING' }, (resp) => {
+        if (resp && resp.error === 'NOT_IN_MEETING') {
+          showToast(resp.message, 'warn');
+        } else if (resp && resp.error) {
+          showToast(resp.message || resp.error, 'error');
+        }
+      });
     });
   }
 
@@ -531,25 +544,23 @@
       }
     }
     
-    // Recording controls
+    // Recording controls.
+    // #2: No Stop button — recording stops automatically when the meeting ends. While recording,
+    // we only show Pause/Resume; the Start button is hidden.
     const recordBtn = document.getElementById('gmr-btn-record');
     const pauseBtn = document.getElementById('gmr-btn-pause');
-    
-    if (recordBtn) {
+
+    if (recordBtn && pauseBtn) {
       if (state.isRecording) {
-        recordBtn.textContent = 'Stop';
-        recordBtn.className = 'gmr-btn gmr-btn-danger';
-        if (pauseBtn) {
-          pauseBtn.style.display = 'block';
-          pauseBtn.textContent = state.isPaused ? 'Resume' : 'Pause';
-          pauseBtn.className = state.isPaused ? 'gmr-btn gmr-btn-primary' : 'gmr-btn gmr-btn-warning';
-        }
+        recordBtn.style.display = 'none';
+        pauseBtn.style.display = 'block';
+        pauseBtn.textContent = state.isPaused ? 'Resume' : 'Pause';
+        pauseBtn.className = state.isPaused ? 'gmr-btn gmr-btn-primary' : 'gmr-btn gmr-btn-warning';
       } else {
+        recordBtn.style.display = 'block';
         recordBtn.textContent = 'Start Recording';
         recordBtn.className = 'gmr-btn gmr-btn-primary';
-        if (pauseBtn) {
-          pauseBtn.style.display = 'none';
-        }
+        pauseBtn.style.display = 'none';
       }
     }
     
@@ -598,35 +609,51 @@
     }
   }
 
-  function autoEnableCaptions() {
+  // Locate the closed-captions TOGGLE button (not the settings tab / menu item).
+  function findCaptionButton() {
     const ccButtons = document.querySelectorAll('button[aria-label*="caption" i], button[data-tooltip*="caption" i], button[aria-label*="cc" i], button[data-tooltip*="cc" i]');
-    let ccButton = null;
     for (const btn of ccButtons) {
       const label = (btn.getAttribute('aria-label') || '').toLowerCase();
       const tooltip = (btn.getAttribute('data-tooltip') || '').toLowerCase();
-      
-      // Exclude settings modal tabs or menu triggers that just say "Captions" or include "settings"
       if (label === 'captions' || tooltip === 'captions' || label.includes('settings') || tooltip.includes('settings') || btn.getAttribute('role') === 'tab') {
         continue;
       }
-      
-      ccButton = btn;
-      break;
+      return btn;
     }
-    
-    if (ccButton) {
-      const isPressed = ccButton.getAttribute('aria-pressed') === 'true';
-      const ariaLabel = (ccButton.getAttribute('aria-label') || '').toLowerCase();
-      
-      if (isPressed || ariaLabel.includes('turn off') || ariaLabel.includes('desactivar') || ariaLabel.includes('stop')) {
-        return true;
-      }
-      
-      console.log('[GMR Content] Captions toggle button found. Enabling closed captions...');
-      ccButton.click();
+    return null;
+  }
+
+  function isCaptionOn(btn) {
+    if (!btn) return false;
+    if (btn.getAttribute('aria-pressed') === 'true') return true;
+    const label = (btn.getAttribute('aria-label') || '').toLowerCase();
+    return label.includes('turn off') || label.includes('desactivar') || label.includes('stop captions');
+  }
+
+  // Ensure captions stay ON. If the user turns them OFF after we've enabled them, re-enable and
+  // warn that transcription needs captions. Only runs while inside the call.
+  function autoEnableCaptions() {
+    if (!isInCall()) return false;
+
+    const btn = findCaptionButton();
+    if (!btn) return false;
+
+    if (isCaptionOn(btn)) {
+      captionsArmed = true;
       return true;
     }
-    return false;
+
+    // Captions are OFF.
+    const now = Date.now();
+    if (captionsArmed && now > captionWarnCooldownUntil) {
+      // We had captions on and they're off now -> the user turned them off.
+      showToast('Live captions are required for transcription. We\'ve turned them back on — the transcript won\'t be captured if you turn captions off again.', 'warn');
+    }
+    console.log('[GMR Content] Enabling closed captions...');
+    btn.click();
+    captionsArmed = true;
+    captionWarnCooldownUntil = now + 4000; // suppress duplicate warnings while the UI settles
+    return true;
   }
 
   // ==================== MEETING-END DETECTION ====================
@@ -789,6 +816,7 @@
   // Diff the live DOM against the cache and emit JOINED / LEFT deltas.
   function reconcileParticipants() {
     const inCall = isInCall();
+    reportInMeeting(inCall);
 
     // Outside the call: clear the roster so the UI never shows phantom "Active 3" counts.
     if (!inCall) {
@@ -893,152 +921,305 @@
     pushParticipantState(true);
   }
 
+  // Persist whether the user is actually inside the call. Background reads this to refuse
+  // recording (and creating a server session) until the user has truly joined.
+  function reportInMeeting(inCall) {
+    if (inCall === lastReportedInMeeting) return;
+    lastReportedInMeeting = inCall;
+    chrome.storage.local.set({ inMeeting: inCall });
+  }
+
+  // ==================== TOAST ====================
+  function showToast(message, variant) {
+    const existing = document.getElementById('gmr-toast');
+    if (existing) existing.remove();
+
+    if (!document.getElementById('gmr-toast-styles')) {
+      const st = document.createElement('style');
+      st.id = 'gmr-toast-styles';
+      st.textContent = `
+        #gmr-toast {
+          position: fixed; bottom: 90px; left: 50%; transform: translateX(-50%);
+          z-index: 1000000; max-width: 420px;
+          background: rgba(28,28,30,0.95); color: #fff;
+          border: 1px solid rgba(255,255,255,0.12); border-left: 4px solid #0a84ff;
+          border-radius: 12px; padding: 12px 16px;
+          font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+          font-size: 13px; line-height: 1.4; box-shadow: 0 8px 30px rgba(0,0,0,0.5);
+          animation: gmr-toast-in 0.25s ease;
+        }
+        #gmr-toast.warn { border-left-color: #ff9500; }
+        #gmr-toast.error { border-left-color: #ff3b30; }
+        @keyframes gmr-toast-in { from { opacity: 0; transform: translate(-50%, 12px); } to { opacity: 1; transform: translate(-50%, 0); } }
+      `;
+      document.head.appendChild(st);
+    }
+
+    const toast = createDOMElement('div', { id: 'gmr-toast', className: variant || '' }, [message]);
+    document.body.appendChild(toast);
+    setTimeout(() => { if (toast.parentNode) toast.remove(); }, 6000);
+  }
+
+  // ==================== PERSISTENT REMINDERS ====================
+  // Unlike the transient toast, a reminder stays on screen the WHOLE time an actionable condition
+  // is true (e.g. you're in the meeting but haven't started recording, or your mic isn't enabled).
+  // Dismissing it just snoozes it — it re-appears after a cooldown so a forgotten step keeps nagging.
+  const reminderSnoozedUntil = {}; // id -> timestamp until which it stays hidden
+  let currentReminderId = null;
+
+  function getActiveReminder() {
+    const now = Date.now();
+    const inCall = isInCall();
+    const rec = !!gmrState.isRecording;
+
+    // Highest priority first.
+    const candidates = [
+      {
+        id: 'start-recording',
+        active: inCall && !rec,
+        message: 'You\'re in the meeting but recording hasn\'t started.',
+        actionLabel: 'Start Recording',
+        action: handleRecordButtonClick,
+        snoozeMs: 30000
+      },
+      {
+        id: 'ws-disconnected',
+        active: rec && !gmrState.wsConnected,
+        message: 'Lost connection to the recording server — reconnecting…',
+        snoozeMs: 15000
+      },
+      {
+        id: 'enable-mic',
+        active: rec && !gmrState.micEnabled,
+        message: 'Your own voice isn\'t being recorded. Click the extension icon in the toolbar, then "Enable my mic".',
+        snoozeMs: 60000
+      }
+    ];
+
+    for (const c of candidates) {
+      if (!c.active) continue;
+      if (now < (reminderSnoozedUntil[c.id] || 0)) continue; // snoozed
+      return c;
+    }
+    return null;
+  }
+
+  function updateReminders() {
+    const reminder = getActiveReminder();
+    const banner = document.getElementById('gmr-reminder');
+
+    if (!reminder) {
+      if (banner) banner.remove();
+      currentReminderId = null;
+      return;
+    }
+    if (banner && currentReminderId === reminder.id) return; // already showing it
+
+    if (banner) banner.remove();
+    currentReminderId = reminder.id;
+    renderReminderBanner(reminder);
+  }
+
+  function injectReminderStyles() {
+    if (document.getElementById('gmr-reminder-styles')) return;
+    const st = document.createElement('style');
+    st.id = 'gmr-reminder-styles';
+    st.textContent = `
+      #gmr-reminder {
+        position: fixed; top: 14px; left: 50%; transform: translateX(-50%);
+        z-index: 1000001; display: flex; align-items: center; gap: 12px;
+        max-width: 560px; padding: 10px 12px 10px 16px;
+        background: rgba(40, 28, 8, 0.96); color: #fff;
+        border: 1px solid rgba(255, 159, 10, 0.5); border-radius: 12px;
+        box-shadow: 0 10px 34px rgba(0,0,0,0.55);
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-size: 13px;
+        animation: gmr-reminder-in 0.25s ease;
+      }
+      @keyframes gmr-reminder-in { from { opacity: 0; transform: translate(-50%, -10px); } to { opacity: 1; transform: translate(-50%, 0); } }
+      .gmr-reminder-icon { color: #ff9f0a; font-size: 14px; flex-shrink: 0; }
+      .gmr-reminder-msg { flex: 1; line-height: 1.4; }
+      .gmr-reminder-action {
+        background: #ff9f0a; color: #1c1c1e; border: none; border-radius: 8px;
+        padding: 7px 12px; font-size: 12px; font-weight: 700; cursor: pointer; white-space: nowrap;
+      }
+      .gmr-reminder-action:hover { opacity: 0.9; }
+      .gmr-reminder-dismiss {
+        background: rgba(255,255,255,0.1); border: none; color: #fff; width: 26px; height: 26px;
+        border-radius: 50%; cursor: pointer; font-size: 16px; line-height: 1; flex-shrink: 0;
+      }
+      .gmr-reminder-dismiss:hover { background: rgba(255,255,255,0.2); }
+    `;
+    document.head.appendChild(st);
+  }
+
+  function renderReminderBanner(reminder) {
+    injectReminderStyles();
+    const children = [
+      createDOMElement('span', { className: 'gmr-reminder-icon' }, ['⚠️']),
+      createDOMElement('span', { className: 'gmr-reminder-msg' }, [reminder.message])
+    ];
+    if (reminder.actionLabel && reminder.action) {
+      children.push(createDOMElement('button', {
+        className: 'gmr-reminder-action',
+        onClick: () => { reminder.action(); updateReminders(); }
+      }, [reminder.actionLabel]));
+    }
+    children.push(createDOMElement('button', {
+      className: 'gmr-reminder-dismiss',
+      title: 'Dismiss (will remind again later)',
+      onClick: () => {
+        reminderSnoozedUntil[reminder.id] = Date.now() + reminder.snoozeMs;
+        const b = document.getElementById('gmr-reminder');
+        if (b) b.remove();
+        currentReminderId = null;
+      }
+    }, ['×']));
+
+    document.body.appendChild(createDOMElement('div', { id: 'gmr-reminder' }, children));
+  }
+
   // ==================== TRANSCRIPT CAPTURE ====================
+  //
+  // Meet renders live captions as blocks of [avatar <img>][speaker name][spoken text]. We anchor
+  // on the avatar <img> (a stable structural element) instead of rotating CSS classes to pull out
+  // the speaker + text. Captions grow in-place as a person talks, so we key the latest text per
+  // speaker and only emit a line once it has STABILIZED (no change for ~1.2s) — that yields one
+  // clean line per utterance in near real time, instead of flooding the server with partials.
+
+  // speaker -> { text, lastChange, emittedText }
+  const captionState = new Map();
+  let captionStabilizeTimer = null;
+  let seenTranscriptKeys = new Set();
+
   function setupTranscriptCapture() {
     console.log('[GMR Content] Setting up transcript capture...');
-    
-    const findTranscriptContainer = () => {
-      const selectors = [
-        '.V6Yesc',
-        '.a4cQT',
-        '.Mz6pEf',
-        '[jsname="tgaKEf"]',
-        '.bY93Qe',
-        '.TBMuR'
-      ];
-      
-      for (const selector of selectors) {
-        const el = document.querySelector(selector);
-        if (el) {
-          transcriptContainer = el;
-          console.log('[GMR Content] Transcript container found:', selector);
-          observeTranscript(el);
-          return true;
+
+    const tryAttach = () => {
+      const container = findCaptionContainer();
+      if (container && container !== transcriptContainer) {
+        transcriptContainer = container;
+        console.log('[GMR Content] Caption container attached');
+        observeTranscript(container);
+      }
+      return !!container;
+    };
+
+    // Keep (re)attaching: the caption container is created/destroyed as captions toggle.
+    if (!tryAttach()) {
+      const retry = setInterval(() => tryAttach(), 2000);
+      setTimeout(() => clearInterval(retry), 120000);
+    }
+
+    // Stabilization loop: finalize + emit caption lines that have stopped changing.
+    if (captionStabilizeTimer) clearInterval(captionStabilizeTimer);
+    captionStabilizeTimer = setInterval(flushStableCaptions, 700);
+  }
+
+  function findCaptionContainer() {
+    // 1) Accessibility / attribute hooks (most stable).
+    const byAria = document.querySelector('[aria-label*="caption" i][role="region"], [role="region"][aria-label*="caption" i]');
+    if (byAria) return byAria;
+
+    // 2) Known (rotating) class/jsname fallbacks.
+    const known = document.querySelector('.a4cQT, .iOzk7, [jsname="dsyhDe"], .V6Yesc');
+    if (known) return known;
+
+    // 3) Structural heuristic: the region that holds caption blocks (avatar <img> next to text).
+    const imgs = document.querySelectorAll('img');
+    for (const img of imgs) {
+      const block = img.closest('div');
+      if (block && (block.textContent || '').trim().length > 0) {
+        const region = block.parentElement && block.parentElement.parentElement;
+        if (region && region.querySelectorAll('img').length >= 1 &&
+            (region.textContent || '').trim().length > 2) {
+          // Heuristic gate: avoid matching the participant grid (which also has avatars).
+          if (/caption|cc/i.test(region.getAttribute('aria-label') || '')) return region;
         }
       }
-      return false;
-    };
-    
-    if (!findTranscriptContainer()) {
-      const retryInterval = setInterval(() => {
-        if (findTranscriptContainer()) {
-          clearInterval(retryInterval);
-        }
-      }, 2000);
-      
-      setTimeout(() => clearInterval(retryInterval), 60000);
     }
+    return null;
   }
 
   function observeTranscript(container) {
-    extractExistingTranscript(container);
-    
-    transcriptObserver = new MutationObserver((mutations) => {
-      for (const mutation of mutations) {
-        if (mutation.type === 'childList') {
-          mutation.addedNodes.forEach(node => {
-            if (node.nodeType === Node.ELEMENT_NODE) {
-              extractTranscriptLine(node);
-            }
-          });
-        }
-      }
+    if (transcriptObserver) transcriptObserver.disconnect();
+    scanCaptions(container);
+
+    let debounce = null;
+    transcriptObserver = new MutationObserver(() => {
+      if (debounce) return;
+      debounce = setTimeout(() => { debounce = null; scanCaptions(container); }, 150);
     });
-    
-    transcriptObserver.observe(container, {
-      childList: true,
-      subtree: true
-    });
+    transcriptObserver.observe(container, { childList: true, subtree: true, characterData: true });
   }
 
-  function extractExistingTranscript(container) {
-    const lineSelectors = ['.TBMuR', '.bY93Qe', '.Mz6pEf', '> div'];
-    
-    for (const selector of lineSelectors) {
-      const lines = container.querySelectorAll(selector);
-      lines.forEach(line => extractTranscriptLine(line));
+  // Read every caption block currently in the container and update the per-speaker latest text.
+  function scanCaptions(container) {
+    if (!container) return;
+    const now = Date.now();
+    const blocks = [];
+
+    // Primary: anchor on avatar <img>; the speaker name sits in the avatar's wrapper and the
+    // spoken text is the rest of the block.
+    const imgs = container.querySelectorAll('img');
+    imgs.forEach(img => {
+      const header = img.parentElement;
+      if (!header) return;
+      const block = header.parentElement || header;
+      const speaker = cleanName(header.textContent) || 'Unknown';
+      let text = (block.textContent || '').trim();
+      if (speaker && speaker !== 'Unknown' && text.startsWith(speaker)) {
+        text = text.slice(speaker.length);
+      }
+      text = text.replace(/^[\s:–-]+/, '').trim();
+      if (text) blocks.push({ speaker, text });
+    });
+
+    // Fallback: no avatars (caption-only layout) — split the visible text into "Name\n text" rows.
+    if (blocks.length === 0) {
+      const raw = (container.innerText || container.textContent || '').trim();
+      if (raw) blocks.push({ speaker: 'Unknown', text: raw });
+    }
+
+    for (const b of blocks) {
+      const st = captionState.get(b.speaker) || { text: '', lastChange: 0, emittedText: '' };
+      if (b.text !== st.text) { st.text = b.text; st.lastChange = now; }
+      captionState.set(b.speaker, st);
     }
   }
 
-  let seenTranscriptKeys = new Set();
+  // Emit caption lines that have been stable for >= 1.2s (utterance finished).
+  function flushStableCaptions() {
+    const now = Date.now();
+    for (const [speaker, st] of captionState) {
+      if (st.text && st.text !== st.emittedText && (now - st.lastChange) >= 1200) {
+        st.emittedText = st.text;
+        emitTranscriptLine(speaker, st.text);
+      }
+    }
+    // Bound memory.
+    if (captionState.size > 50) {
+      const entries = Array.from(captionState.entries()).slice(-25);
+      captionState.clear();
+      entries.forEach(([k, v]) => captionState.set(k, v));
+    }
+  }
 
-  function extractTranscriptLine(element) {
-    let speaker = null;
-    let text = null;
-    
-    const speakerSelectors = [
-      '.PABS8e',
-      '.Mz6pEf .PABS8e',
-      '.TBMuR .PABS8e',
-      '[class*="name"]',
-      '.zWfAib'
-    ];
-    
-    for (const selector of speakerSelectors) {
-      const el = element.querySelector ? element.querySelector(selector) : null;
-      if (el && el.textContent.trim()) {
-        speaker = el.textContent.trim();
-        break;
-      }
-    }
-    
-    const textSelectors = [
-      '.bY97s',
-      '.V6Yesc span:last-child',
-      '.TBMuR span:last-child',
-      'span:last-child'
-    ];
-    
-    for (const selector of textSelectors) {
-      const el = element.querySelector ? element.querySelector(selector) : null;
-      if (el && el.textContent.trim()) {
-        const fullText = el.textContent.trim();
-        if (speaker && fullText.startsWith(speaker)) {
-          text = fullText.substring(speaker.length).replace(/^:\s*/, '');
-        } else {
-          text = fullText;
-        }
-        break;
-      }
-    }
-    
-    if (!text && element.textContent) {
-      const fullText = element.textContent.trim();
-      if (fullText) {
-        const parts = fullText.split(/:\s*/);
-        if (parts.length >= 2 && parts[0].length < 50) {
-          speaker = speaker || parts[0];
-          text = parts.slice(1).join(': ');
-        } else {
-          text = fullText;
-        }
-      }
-    }
-    
+  function emitTranscriptLine(speaker, text) {
     if (!text || text.length < 2) return;
-    
-    const key = `${speaker}-${text}`;
+    const key = `${speaker}::${text}`;
     if (seenTranscriptKeys.has(key)) return;
     seenTranscriptKeys.add(key);
-    
     if (seenTranscriptKeys.size > 1000) {
       seenTranscriptKeys = new Set(Array.from(seenTranscriptKeys).slice(-500));
     }
-    
-    const timestamp = new Date().toISOString();
-    
-    if (!speaker) {
-      speaker = 'Unknown';
-    }
-    
+
     console.log(`[GMR Content] Transcript: [${speaker}] ${text}`);
-    
     chrome.runtime.sendMessage({
       type: 'TRANSCRIPT_LINE',
-      speaker: speaker,
-      text: text,
-      timestamp: timestamp,
-      meetingId: meetingId
+      speaker: speaker || 'Unknown',
+      text,
+      timestamp: new Date().toISOString(),
+      meetingId
     });
   }
 
