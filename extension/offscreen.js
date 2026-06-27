@@ -6,6 +6,7 @@ let recordedChunks = [];
 let ws = null;
 let meetingId = null;
 let wsUrl = null;
+let authToken = null;
 let recordingStartTime = null;
 let chunkSequence = 0;
 let reconnectTimer = null;
@@ -22,7 +23,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     try {
       switch (message.type) {
         case 'START_RECORDING':
-          await startRecording(message.wsUrl, message.meetingId);
+          await startRecording(message.wsUrl, message.meetingId, message.authToken);
           sendResponse({ success: true });
           break;
         case 'STOP_RECORDING':
@@ -42,6 +43,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             type: 'participant',
             event: message.event,
             name: message.name,
+            participantId: message.participantId || null,
+            activeCount: message.activeCount,
+            totalCount: message.totalCount,
             timestamp: message.timestamp,
             meetingId: meetingId
           });
@@ -70,9 +74,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });
 
 // Start recording with display media
-async function startRecording(serverUrl, mId) {
+async function startRecording(serverUrl, mId, token) {
   wsUrl = serverUrl;
   meetingId = mId;
+  authToken = token || null;
   
   console.log('[GMR Offscreen] Starting recording for meeting:', meetingId);
   console.log('[GMR Offscreen] WebSocket URL:', wsUrl);
@@ -373,7 +378,8 @@ function connectWebSocket() {
         sendJSONMessage({
           type: 'auth',
           meetingId: meetingId,
-          clientType: 'recorder'
+          clientType: 'recorder',
+          token: authToken || undefined
         });
         
         // Start heartbeat

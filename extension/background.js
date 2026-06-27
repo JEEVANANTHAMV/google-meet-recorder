@@ -107,8 +107,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         case 'PARTICIPANT_EVENT':
           await handleParticipantEvent(message, sendResponse);
           break;
-        case 'PARTICIPANT_COUNT_UPDATE':
-          await handleParticipantCountUpdate(message, sendResponse);
+        case 'PARTICIPANT_STATE':
+          await handleParticipantState(message, sendResponse);
           break;
         case 'TRANSCRIPT_LINE':
           await handleTranscriptLine(message, sendResponse);
@@ -162,21 +162,22 @@ async function handleStartRecording(message, sendResponse) {
   console.log('[GMR] Starting recording...');
   
   // Get meeting info from storage
-  const data = await chrome.storage.local.get(['meetingId', 'wsUrl']);
-  
+  const data = await chrome.storage.local.get(['meetingId', 'wsUrl', 'wsAuthToken']);
+
   if (!data.meetingId) {
     sendResponse({ error: 'No active meeting detected. Join a Google Meet first.' });
     return;
   }
-  
+
   // Setup offscreen document for recording
   await setupOffscreenDocument(OFFSCREEN_DOCUMENT_PATH);
-  
+
   // Send start command to offscreen
   const result = await sendToOffscreen({
     type: 'START_RECORDING',
     wsUrl: data.wsUrl || 'ws://164.52.198.68:8001',
-    meetingId: data.meetingId
+    meetingId: data.meetingId,
+    authToken: data.wsAuthToken || null
   });
   
   if (result.success) {
@@ -188,8 +189,19 @@ async function handleStartRecording(message, sendResponse) {
       lastDownloadUrl: null,
       lastFilename: null
     });
+
+    // Ask the content script to re-emit the current roster so the server-side session
+    // records everyone who was already in the call before the socket opened.
+    const tabData = await chrome.storage.local.get(['recordedTabId']);
+    if (tabData.recordedTabId) {
+      try {
+        chrome.tabs.sendMessage(tabData.recordedTabId, { type: 'FLUSH_PARTICIPANTS' });
+      } catch (err) {
+        console.warn('[GMR] Failed to request participant flush:', err);
+      }
+    }
   }
-  
+
   sendResponse(result);
 }
 
@@ -228,54 +240,51 @@ async function handleUpdateSettings(message, sendResponse) {
   sendResponse({ success: true });
 }
 
-// Handle participant count update from content script
-async function handleParticipantCountUpdate(message, sendResponse) {
-  const { count } = message;
-  await chrome.storage.local.set({ activeParticipants: count });
+// Handle a count-only sync from the content script's snapshot-diff engine.
+// The content script is the single source of truth for counts, so we just persist them.
+async function handleParticipantState(message, sendResponse) {
+  const activeParticipants = message.activeCount || 0;
+  const totalParticipants = message.totalCount || 0;
+  await chrome.storage.local.set({ activeParticipants, totalParticipants });
   await broadcastToPopups({
     type: 'PARTICIPANT_COUNT_UPDATE_POPUP',
-    count: count
+    activeParticipants,
+    totalParticipants
   });
   sendResponse({ success: true });
 }
 
-// Handle participant event from content script
+// Handle a participant join/left delta from the content script.
+// Counts come straight from the content script (no local increment/decrement — that drifts).
 async function handleParticipantEvent(message, sendResponse) {
-  const { event, name, timestamp } = message;
-  
-  // Update counters
-  const data = await chrome.storage.local.get(['activeParticipants', 'totalParticipants', 'activityLog', 'isRecording']);
-  let activeParticipants = data.activeParticipants || 0;
-  let totalParticipants = data.totalParticipants || 0;
-  
-  if (event === 'joined') {
-    activeParticipants++;
-    totalParticipants++;
-  } else if (event === 'left') {
-    activeParticipants = Math.max(0, activeParticipants - 1);
-  }
-  
+  const { event, name, participantId, timestamp } = message;
+  const activeParticipants = message.activeCount || 0;
+  const totalParticipants = message.totalCount || 0;
+
+  const data = await chrome.storage.local.get(['activityLog', 'isRecording']);
+
   const activityLog = data.activityLog || [];
   activityLog.unshift({ event, name, timestamp });
-  // Keep last 100 entries
   if (activityLog.length > 100) activityLog.length = 100;
-  
+
   await chrome.storage.local.set({ activeParticipants, totalParticipants, activityLog });
-  
+
   // Forward to popup
   await broadcastToPopups({
     type: 'PARTICIPANT_UPDATE',
     event, name, timestamp, activeParticipants, totalParticipants
   });
-  
-  // Forward to offscreen to send over WebSocket if recording
+
+  // Stream to the server over the WebSocket (offscreen owns the socket) while recording.
   if (data.isRecording) {
     await sendToOffscreen({
       type: 'SEND_PARTICIPANT',
-      event, name, timestamp
+      event, name, participantId, timestamp,
+      activeCount: activeParticipants,
+      totalCount: totalParticipants
     });
   }
-  
+
   sendResponse({ success: true });
 }
 

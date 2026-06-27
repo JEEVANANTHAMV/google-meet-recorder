@@ -1,0 +1,38 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\('\\\\n'.join\\(f'{k}: {\\(v[:40]+\\\\\"...\\\\\"\\) if isinstance\\(v,str\\) and len\\(v\\)>40 else v}' for k,v in d.items\\(\\)\\)\\)\")",
+      "Bash(npm --version)",
+      "Bash(timeout 15 npm ping)",
+      "Bash(timeout 300 npm install @google-cloud/storage pino pino-pretty)",
+      "Bash(*)",
+      "Bash(node gcs-test.js)",
+      "Bash(rm -f gcs-test.js)",
+      "Bash(node cleanup.js)",
+      "Bash(node --check extension/content.js)",
+      "Bash(node --check extension/background.js)",
+      "Bash(node --check extension/offscreen.js)",
+      "Bash(node --check extension/popup.js)",
+      "Bash(node --check server.js)",
+      "Bash(node --check storage.js)",
+      "Bash(node --check logger.js)",
+      "Bash(node setup-gcs.js)",
+      "Bash(STORAGE_BACKEND=gcs LOG_PRETTY=true node server.js)",
+      "Bash(echo \"server pid $!\")",
+      "Read(//tmp/**)",
+      "Bash(PORT=8123 STORAGE_BACKEND=gcs node server.js)",
+      "Bash(PORT=8123 node e2e-test.js)",
+      "Bash(node verify-gcs.js)",
+      "Bash(kill 552123)",
+      "Bash(PORT=8124 STORAGE_BACKEND=local node server.js)",
+      "Bash(echo \"pid $!\")",
+      "Bash(PORT=8124 node e2e-test.js)",
+      "Bash(kill 609137)",
+      "Bash(node cleanup-test.js)",
+      "Bash(node -e \"require\\('jsdom'\\); console.log\\('jsdom available'\\)\")",
+      "Bash(timeout 120 npm install jsdom --no-save)",
+      "Bash(timeout 60 node tracker-test.js)",
+      "Bash(npm ls *)"
+    ]
+  }
+}

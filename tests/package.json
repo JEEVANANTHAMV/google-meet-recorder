@@ -1,0 +1,11 @@
+{
+  "name": "gmeet-dom-test",
+  "version": "1.0.0",
+  "description": "Playwright-based DOM capture test for Google Meet Recorder",
+  "scripts": {
+    "test": "node test-meet-dom.js",
+    "test:ui": "node test-meet-dom.js --ui"
+  },
+  "type": "commonjs",
+  "dependencies": {}
+}

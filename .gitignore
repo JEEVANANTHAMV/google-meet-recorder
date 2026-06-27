@@ -1,1 +1,15 @@
 node_modules/
+
+# Secrets — never commit
+**/Service-Account.json
+**/*.serviceaccount.json
+.env
+**/.env
+!**/.env.example
+
+# Local recordings (when STORAGE_BACKEND=local)
+test-server/recordings/
+
+# Logs / OS junk
+*.log
+.DS_Store

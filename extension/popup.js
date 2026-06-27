@@ -496,7 +496,10 @@ function handleRuntimeMessage(message, sender, sendResponse) {
       break;
     
     case 'PARTICIPANT_COUNT_UPDATE_POPUP':
-      state.activeParticipants = message.count;
+      state.activeParticipants = message.activeParticipants || 0;
+      if (typeof message.totalParticipants === 'number') {
+        state.totalParticipants = message.totalParticipants;
+      }
       renderMeetingInfo();
       break;
     

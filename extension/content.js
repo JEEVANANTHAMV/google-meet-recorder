@@ -12,11 +12,19 @@
   let participantObserver = null;
   let transcriptObserver = null;
   let warningBanner = null;
-  let knownParticipants = new Set();
   let transcriptContainer = null;
-  let lastParticipantCount = null;
   let periodicIntervalId = null;
   let timerIntervalId = null;
+  let reconcileDebounce = null;
+  let lastSentActiveCount = null;
+  let lastSentTotalCount = null;
+  let wasInCall = false;
+
+  // ===== Participant tracking: stable-identity cache + snapshot-diff engine =====
+  // id -> { id, name, joinedAt, lastSeen, leftAt, missingSince }
+  const participantCache = new Map();
+  const LEAVE_GRACE_MS = 4000;       // confirm a LEFT only after this long missing (avoids SPA re-render false positives)
+  const RECONCILE_INTERVAL_MS = 2000; // how often we diff the DOM against the cache
 
   let gmrState = {
     wsUrl: 'ws://164.52.198.68:8001',
@@ -34,28 +42,32 @@
     lastFilename: null
   };
 
-  // DOM Selectors for Google Meet (these may need updating as Meet evolves)
+  // DOM Selectors for Google Meet.
+  // Participant tracking deliberately AVOIDS obfuscated CSS classes (.zWfAib etc.) because
+  // Google rotates them every few weeks. We rely on stable attribute / accessibility hooks
+  // (data-participant-id, role=listitem, aria-label, data-self-name) — see snapshotParticipants().
   const SELECTORS = {
-    // Participant list
-    participantList: '[data-participant-id], [jscontroller] [role="listitem"] .zWfAib, .KV1GEc, .dwSJ2e',
-    participantName: '.zWfAib, .KV1GEc .zWfAib, .dwSJ2e .zWfAib, [data-self-name], .GvcuGe, .N0PJ8e',
-    
-    // Alternative participant selectors
-    participantItem: '[role="listitem"]',
-    participantNameAlt: '.zWfAib',
-    
-    // Live captions / transcript
+    // Stable hooks that identify a unique participant in the call (tiles AND people panel)
+    participantId: '[data-participant-id]',
+    peopleListItem: '[role="listitem"][data-participant-id], [role="list"] [role="listitem"]',
+
+    // Live captions / transcript (still class-based; updated best-effort)
     transcriptContainer: '.V6Yesc, .a4cQT, .Mz6pEf, [jsname="tgaKEf"], .bY93Qe, .TBMuR',
     transcriptLine: '.TBMuR, .bY93Qe, .Mz6pEf, .V6Yesc > div',
     transcriptSpeaker: '.Mz6pEf .PABS8e, .TBMuR .PABS8e, .bY93Qe .PABS8e',
     transcriptText: '.Mz6pEf .bY97s, .TBMuR .bY97s, .bY93Qe .bY97s, .V6Yesc span:last-child',
-    
-    // Meeting title/info
-    meetingTitle: '[data-meeting-title], .N6dS8c, .Jyj1Td, .CkXZgc',
-    
+
     // Self name
-    selfName: '[data-self-name], .GvcuGe'
+    selfName: '[data-self-name]'
   };
+
+  // Strings that look like names but are actually Meet UI chrome — never treat these as participants.
+  const UI_NOISE = new Set([
+    'you', 'me', 'mic', 'camera', 'present', 'presenting', 'chat', 'people', 'raise hand',
+    'more options', 'more', 'cc', 'captions', 'pin', 'pinned', 'unpin', 'remove', 'mute',
+    'muted', 'unmute', 'host', 'co-host', 'meeting host', 'screen share', 'is presenting',
+    'turn off', 'turn on', 'add people', 'search for people', 'contributors', 'in this call'
+  ]);
 
   // ==================== DOM CREATION HELPER ====================
   // Safe helper to build DOM elements without innerHTML (complying with secure coding guidelines)
@@ -123,26 +135,17 @@
     
     // Monitor URL changes (for SPA navigation)
     setupUrlMonitoring();
-    
-    // Try to get self name
-    detectSelfName();
 
-    // Start periodic tasks loop (auto-captions, grid participants scan, count scrape, check end)
+    // Start periodic tasks loop: reconcile participants, auto-captions, detect meeting end.
     if (periodicIntervalId) clearInterval(periodicIntervalId);
     periodicIntervalId = setInterval(() => {
       autoEnableCaptions();
-      scanGridParticipants();
+      reconcileParticipants();
       checkMeetingEnded();
-      
-      const count = getParticipantCountFromUI();
-      if (count !== null && count !== lastParticipantCount) {
-        lastParticipantCount = count;
-        chrome.runtime.sendMessage({
-          type: 'PARTICIPANT_COUNT_UPDATE',
-          count: count
-        });
-      }
-    }, 3000);
+    }, RECONCILE_INTERVAL_MS);
+
+    // Run one reconcile pass immediately so we don't wait for the first interval tick.
+    reconcileParticipants();
   }
 
   // Extract meeting ID from URL
@@ -643,243 +646,251 @@
     }
   }
 
-  // ==================== PARTICIPANT TRACKING ====================
+  // ==================== PARTICIPANT TRACKING (snapshot-diff engine) ====================
+  //
+  // How it works:
+  //  1. snapshotParticipants() reads the CURRENT set of participants straight from the DOM,
+  //     keyed by a stable identity (data-participant-id, falling back to a normalized name).
+  //  2. reconcileParticipants() diffs that snapshot against participantCache:
+  //       - id present in snapshot but not cache  -> JOINED
+  //       - id in cache but missing from snapshot for >= LEAVE_GRACE_MS -> LEFT
+  //  3. Active count is ALWAYS derived from the cache (entries with leftAt === null), so it can
+  //     never drift the way an increment/decrement counter does.
+  //  4. Everything is gated on isInCall() so nothing is reported from the lobby / home screen.
   function setupParticipantTracking() {
-    console.log('[GMR Content] Setting up participant tracking observer...');
-    
-    participantObserver = new MutationObserver((mutations) => {
-      for (const mutation of mutations) {
-        if (mutation.type === 'childList') {
-          mutation.addedNodes.forEach(node => {
-            if (node.nodeType === Node.ELEMENT_NODE) {
-              scanForParticipants(node);
-            }
-          });
-          
-          mutation.removedNodes.forEach(node => {
-            if (node.nodeType === Node.ELEMENT_NODE) {
-              scanForDepartures(node);
-            }
-          });
-        }
-      }
-    });
-    
-    participantObserver.observe(document.body, {
-      childList: true,
-      subtree: true
-    });
-    
-    scanForParticipants(document.body);
-    scanGridParticipants();
+    console.log('[GMR Content] Setting up participant tracking (snapshot-diff engine)...');
+
+    // A mutation anywhere in the call surface triggers a (debounced) reconcile so joins/leaves
+    // are caught quickly, in addition to the steady RECONCILE_INTERVAL_MS heartbeat.
+    participantObserver = new MutationObserver(() => scheduleReconcile());
+    participantObserver.observe(document.body, { childList: true, subtree: true });
   }
 
-  function getParticipantCountFromUI() {
-    const selectors = [
-      '[aria-label*="show everyone" i]',
-      '[aria-label*="people" i]',
-      '[aria-label*="participant" i]',
-      '.AwUel',
-      '.Lulu7c',
-      '[jsname="muIDxc"]',
-      '[jsname="U26qK"]'
-    ];
-    
-    for (const selector of selectors) {
-      const el = document.querySelector(selector);
-      if (el) {
-        // Try to look for text content
-        const text = el.textContent || '';
-        const match = text.match(/\d+/);
-        if (match) {
-          const val = parseInt(match[0], 10);
-          if (val > 0) return val;
-        }
-        
-        // Try checking title or aria-label for numbers
-        const ariaLabel = el.getAttribute('aria-label') || '';
-        const ariaMatch = ariaLabel.match(/\d+/);
-        if (ariaMatch) {
-          const val = parseInt(ariaMatch[0], 10);
-          if (val > 0) return val;
-        }
-        
-        // Try checking child elements
-        const badge = el.querySelector('[class*="count" i], span, div');
-        if (badge) {
-          const badgeText = badge.textContent || '';
-          const badgeMatch = badgeText.match(/\d+/);
-          if (badgeMatch) {
-            const val = parseInt(badgeMatch[0], 10);
-            if (val > 0) return val;
-          }
-        }
+  function scheduleReconcile() {
+    if (reconcileDebounce) return;
+    reconcileDebounce = setTimeout(() => {
+      reconcileDebounce = null;
+      reconcileParticipants();
+    }, 400);
+  }
+
+  // Are we actually inside the call (not the green room / lobby / "you left" screen)?
+  function isInCall() {
+    // The "Leave call" / hang-up control only exists once you've joined.
+    const leaveBtn = document.querySelector(
+      'button[aria-label*="leave call" i], button[aria-label*="leave the call" i], ' +
+      'button[aria-label*="end call" i], button[aria-label*="salir de la llamada" i]'
+    );
+    if (leaveBtn) return true;
+    // Fallback: the in-call toolbar exposes mic/camera toggles.
+    const micBtn = document.querySelector(
+      'button[aria-label*="turn off microphone" i], button[aria-label*="turn on microphone" i], ' +
+      'button[aria-label*="turn off camera" i], button[aria-label*="turn on camera" i]'
+    );
+    return !!micBtn;
+  }
+
+  // Build a Map<identity, name> of everyone currently rendered in the call.
+  function snapshotParticipants() {
+    const found = new Map();
+
+    const add = (id, name) => {
+      if (!id) return;
+      const clean = name ? cleanName(name) : null;
+      const prev = found.get(id);
+      // Keep the best name we can find for this identity across all its DOM appearances.
+      if (prev === undefined || (clean && (!prev || prev === 'Guest'))) {
+        found.set(id, clean || prev || 'Guest');
+      }
+    };
+
+    // Strategy 1+2: every element that carries a stable data-participant-id (video tiles AND the
+    // people-panel rows). This is the single most reliable hook in Google Meet.
+    document.querySelectorAll(SELECTORS.participantId).forEach(el => {
+      add(el.getAttribute('data-participant-id'), extractNameFromContainer(el));
+    });
+
+    // Strategy 3: the local user. The self tile usually ALSO carries a data-participant-id (so it
+    // is already counted above), so only add a synthetic self identity if that name isn't present
+    // yet — otherwise we'd double-count ourselves and inflate the active count.
+    const selfEl = document.querySelector(SELECTORS.selfName);
+    if (selfEl) {
+      const selfName = cleanName(selfEl.getAttribute('data-self-name'));
+      if (selfName) {
+        const alreadyPresent = Array.from(found.values())
+          .some(n => n && n.toLowerCase() === selfName.toLowerCase());
+        if (!alreadyPresent) add('self:' + selfName.toLowerCase(), selfName);
       }
     }
-    
-    // Fallback: count unique names in the video grid
-    const gridItems = document.querySelectorAll('[data-participant-id], [data-self-name], .cG2ZCf, .YTbUzc, .GvcuGe, .N0PJ8e');
-    const uniqueNames = new Set();
-    gridItems.forEach(el => {
-      const name = el.getAttribute('data-self-name') || el.textContent.trim();
-      if (name && isValidName(name)) {
-        uniqueNames.add(name);
-      }
-    });
-    if (uniqueNames.size > 0) {
-      return uniqueNames.size;
-    }
-    
-    return null;
-  }
 
-  function scanGridParticipants() {
-    const selectors = [
-      '.GvcuGe', // Self/others in tiles
-      '.N0PJ8e', // Others in tiles
-      '.c7CKJ',  // Side panel list or tiles
-      '.zWfAib', // Side panel list
-      '.cG2ZCf', // Main active speaker tile
-      '.YTbUzc', // Video tile names
-      '.jV5ceb', // General text overlay
-      '[data-self-name]'
-    ];
-    
-    selectors.forEach(selector => {
-      const elements = document.querySelectorAll(selector);
-      elements.forEach(el => {
-        const name = el.getAttribute('data-self-name') || el.textContent.trim();
-        if (name && isValidName(name) && !knownParticipants.has(name)) {
-          knownParticipants.add(name);
-          reportParticipantEvent('joined', name);
-        }
-      });
-    });
-  }
-
-  function scanForParticipants(container) {
-    const selectors = [
-      '[data-participant-id]',
-      '.zWfAib',
-      '.KV1GEc',
-      '.dwSJ2e',
-      '[role="listitem"] .GvcuGe',
-      '[role="listitem"] .N0PJ8e',
-      '.c7CKJ'
-    ];
-    
-    for (const selector of selectors) {
-      const elements = container.querySelectorAll ? container.querySelectorAll(selector) : [];
-      elements.forEach(el => {
-        const name = extractParticipantName(el);
-        if (name && !knownParticipants.has(name)) {
-          knownParticipants.add(name);
-          reportParticipantEvent('joined', name);
-        }
+    // Strategy 4 (fallback only): if Meet ever drops data-participant-id, fall back to the
+    // accessible people list so tracking still degrades gracefully instead of breaking.
+    if (found.size === 0) {
+      document.querySelectorAll('[role="list"] [role="listitem"]').forEach(el => {
+        const name = cleanName(el.getAttribute('aria-label') || extractNameFromContainer(el));
+        if (name) add('name:' + name.toLowerCase(), name);
       });
     }
-    
-    if (container.querySelectorAll) {
-      const avatarElements = container.querySelectorAll('[data-self-name], [title]');
-      avatarElements.forEach(el => {
-        const name = el.getAttribute('data-self-name') || el.getAttribute('title');
-        if (name && name.length > 1 && name.includes(' ') && !knownParticipants.has(name)) {
-          if (isValidName(name)) {
-            knownParticipants.add(name);
-            reportParticipantEvent('joined', name);
-          }
-        }
+
+    return found;
+  }
+
+  // Pull the most name-like string out of a participant container (a tile or list row).
+  function extractNameFromContainer(el) {
+    if (!el) return null;
+
+    // data-self-name is authoritative for the local user (may be on the tile or a descendant).
+    let selfHost = (el.getAttribute && el.getAttribute('data-self-name')) ? el : null;
+    if (!selfHost && el.querySelector) selfHost = el.querySelector('[data-self-name]');
+    if (selfHost) {
+      const selfName = selfHost.getAttribute('data-self-name');
+      if (selfName && isPlausibleName(selfName)) return selfName;
+    }
+
+    // Collect candidate strings from leaf elements (the name overlay is a leaf text node).
+    const candidates = [];
+    const pushCandidate = (t) => { if (t && isPlausibleName(t)) candidates.push(t.trim()); };
+
+    if (el.querySelectorAll) {
+      el.querySelectorAll('*').forEach(node => {
+        if (node.children.length === 0) pushCandidate(node.textContent);
+        const aria = node.getAttribute && node.getAttribute('aria-label');
+        if (aria) pushCandidate(aria);
       });
     }
+    pushCandidate(el.getAttribute && el.getAttribute('aria-label'));
+
+    if (candidates.length === 0) return null;
+    // Names are short; longer strings tend to be captions/labels. Prefer the shortest plausible one.
+    candidates.sort((a, b) => a.length - b.length);
+    return candidates[0];
   }
 
-  function scanForDepartures(node) {
-    if (!node.querySelectorAll) return;
-    
-    const selectors = ['.zWfAib', '.KV1GEc', '[data-participant-id]'];
-    
-    for (const selector of selectors) {
-      const elements = node.querySelectorAll(selector);
-      elements.forEach(el => {
-        const name = extractParticipantName(el);
-        if (name && knownParticipants.has(name)) {
-          setTimeout(() => {
-            const stillPresent = document.querySelectorAll(selector);
-            let found = false;
-            stillPresent.forEach(p => {
-              if (extractParticipantName(p) === name) found = true;
-            });
-            
-            if (!found) {
-              knownParticipants.delete(name);
-              reportParticipantEvent('left', name);
-            }
-          }, 1000);
-        }
-      });
-    }
+  // Normalize a raw name string ("John Doe (You)", "  Jane  ") into a stable display name.
+  function cleanName(str) {
+    if (!str) return null;
+    let s = String(str).trim().replace(/\s+/g, ' ');
+    s = s.replace(/\s*\((you|host|co-host|meeting host|presenting)\)\s*$/i, '').trim();
+    s = s.replace(/['']s presentation$/i, '').trim();
+    return s || null;
   }
 
-  function extractParticipantName(element) {
-    const nameSelectors = [
-      '.zWfAib',
-      '.GvcuGe',
-      '.N0PJ8e',
-      '[data-self-name]',
-      '.c8mVDd',
-      '.YTbUzc'
-    ];
-    
-    for (const selector of nameSelectors) {
-      const el = element.querySelector ? element.querySelector(selector) : null;
-      if (el && el.textContent.trim()) {
-        return el.textContent.trim();
-      }
-    }
-    
-    if (element.textContent && element.textContent.trim().length > 0 && element.textContent.trim().length < 50) {
-      const text = element.textContent.trim();
-      if (isValidName(text)) return text;
-    }
-    
-    if (element.getAttribute) {
-      const title = element.getAttribute('title');
-      if (title && isValidName(title)) return title;
-    }
-    
-    return null;
-  }
-
-  function isValidName(str) {
-    if (!str || str.length < 2 || str.length > 50) return false;
-    if (str.includes('http') || str.includes('google') || str.includes('meet')) return false;
-    const uiLabels = ['mic', 'camera', 'present', 'chat', 'people', 'raise hand', 'more', 'cc', 'you', 'me'];
-    if (uiLabels.includes(str.toLowerCase())) return false;
+  function isPlausibleName(str) {
+    if (!str) return false;
+    const s = String(str).trim();
+    if (s.length < 2 || s.length > 60) return false;
+    if (/^\d+$/.test(s)) return false;                 // pure numbers (counts, timers)
+    if (/https?:|google|meet\.google/i.test(s)) return false;
+    if (!/[a-zÀ-ɏЀ-ӿ一-鿿]/i.test(s)) return false; // must contain a letter
+    if (UI_NOISE.has(s.toLowerCase())) return false;
     return true;
   }
 
-  function reportParticipantEvent(event, name) {
+  // Diff the live DOM against the cache and emit JOINED / LEFT deltas.
+  function reconcileParticipants() {
+    const inCall = isInCall();
+
+    // Outside the call: clear the roster so the UI never shows phantom "Active 3" counts.
+    if (!inCall) {
+      if (participantCache.size > 0) {
+        participantCache.clear();
+        pushParticipantState(true);
+      } else if (wasInCall) {
+        pushParticipantState(true);
+      }
+      wasInCall = false;
+      return;
+    }
+    wasInCall = true;
+
+    const snapshot = snapshotParticipants();
+    const now = Date.now();
+    let changed = false;
+
+    // Joins + refresh lastSeen for everyone currently present.
+    for (const [id, name] of snapshot) {
+      const existing = participantCache.get(id);
+      if (!existing || existing.leftAt) {
+        participantCache.set(id, {
+          id, name: name || 'Guest', joinedAt: now, lastSeen: now, leftAt: null, missingSince: null
+        });
+        emitParticipantEvent('joined', name || 'Guest', id);
+        changed = true;
+      } else {
+        existing.lastSeen = now;
+        existing.missingSince = null;
+        if ((!existing.name || existing.name === 'Guest') && name && name !== 'Guest') {
+          existing.name = name;
+        }
+      }
+    }
+
+    // Leaves: in the cache, not left yet, but missing from the snapshot beyond the grace window.
+    for (const p of participantCache.values()) {
+      if (p.leftAt) continue;
+      if (!snapshot.has(p.id)) {
+        if (!p.missingSince) {
+          p.missingSince = now;
+        } else if (now - p.missingSince >= LEAVE_GRACE_MS) {
+          p.leftAt = now;
+          emitParticipantEvent('left', p.name, p.id);
+          changed = true;
+        }
+      }
+    }
+
+    pushParticipantState(changed);
+  }
+
+  function getActiveCount() {
+    let n = 0;
+    for (const p of participantCache.values()) if (!p.leftAt) n++;
+    return n;
+  }
+
+  function getTotalCount() {
+    return participantCache.size; // distinct identities seen this session
+  }
+
+  // Send a single join/left delta to the background (which persists it and streams it to the server).
+  function emitParticipantEvent(event, name, id) {
     const timestamp = new Date().toISOString();
-    console.log(`[GMR Content] Participant ${event}: ${name}`);
-    
+    console.log(`[GMR Content] Participant ${event}: ${name} (${id}) | active=${getActiveCount()}`);
+
     chrome.runtime.sendMessage({
       type: 'PARTICIPANT_EVENT',
-      event: event,
-      name: name,
-      timestamp: timestamp,
-      meetingId: meetingId
+      event,
+      name: name || 'Guest',
+      participantId: id,
+      timestamp,
+      meetingId,
+      activeCount: getActiveCount(),
+      totalCount: getTotalCount()
     });
   }
 
-  function detectSelfName() {
-    const selfEl = document.querySelector('[data-self-name]');
-    if (selfEl) {
-      const name = selfEl.getAttribute('data-self-name');
-      if (name && !knownParticipants.has(name)) {
-        knownParticipants.add(name);
-        reportParticipantEvent('joined', name);
-      }
+  // Keep the background/UI counts in sync even when no individual delta fired (e.g. on leave-call reset).
+  function pushParticipantState(force) {
+    const active = getActiveCount();
+    const total = getTotalCount();
+    if (!force && active === lastSentActiveCount && total === lastSentTotalCount) return;
+    lastSentActiveCount = active;
+    lastSentTotalCount = total;
+    chrome.runtime.sendMessage({
+      type: 'PARTICIPANT_STATE',
+      activeCount: active,
+      totalCount: total,
+      meetingId
+    });
+  }
+
+  // Re-emit the full current roster as 'joined' events. Called when a recording starts so the
+  // server-side session captures everyone who was already in the call.
+  function flushParticipantRoster() {
+    for (const p of participantCache.values()) {
+      if (!p.leftAt) emitParticipantEvent('joined', p.name, p.id);
     }
+    pushParticipantState(true);
   }
 
   // ==================== TRANSCRIPT CAPTURE ====================
@@ -1190,7 +1201,10 @@
       case 'HIDE_FLOATING_CONTROLS':
         sendResponse({ success: true });
         break;
-      case 'PARTICIPANT_COUNT_UPDATE':
+      case 'FLUSH_PARTICIPANTS':
+        // Recording just started — re-emit the current roster so the server captures
+        // everyone who was already in the call before the WebSocket existed.
+        flushParticipantRoster();
         sendResponse({ success: true });
         break;
       default:
