@@ -162,7 +162,9 @@ async function handleStartRecording(message, sendResponse) {
   console.log('[GMR] Starting recording...');
 
   // Get meeting info from storage
-  const data = await chrome.storage.local.get(['meetingId', 'wsUrl', 'wsAuthToken', 'recordedTabId', 'inMeeting', 'micEnabled']);
+  const data = await chrome.storage.local.get([
+    'meetingId', 'wsUrl', 'wsAuthToken', 'recordedTabId', 'inMeeting', 'micEnabled', 'forceDisplayCapture'
+  ]);
 
   // #1: Only record once the user is actually INSIDE the call (not the lobby/green room).
   // Bail out before creating any session / offscreen doc / WebSocket.
@@ -175,7 +177,11 @@ async function handleStartRecording(message, sendResponse) {
   // all participants' audio included). The popup acquires this in its gesture context and passes it
   // here (most reliable). If absent (e.g. started from the in-page panel), try from the worker.
   let streamId = message.streamId || null;
-  if (streamId) {
+  if (data.forceDisplayCapture) {
+    console.log('[GMR] Forcing display capture (getDisplayMedia) for this recording');
+    streamId = null; // force display capture popup
+    await chrome.storage.local.set({ forceDisplayCapture: false });
+  } else if (streamId) {
     console.log('[GMR] Using tabCapture stream id from popup');
   } else {
     let targetTabId = data.recordedTabId;
@@ -409,9 +415,32 @@ async function handleRecordingStatus(message, sendResponse) {
 
 // Handle recording saved from offscreen
 async function handleRecordingSaved(message, sendResponse) {
-  const { downloadUrl, filename } = message;
+  const { downloadUrl, filename, meetingId, sessionId } = message;
+
+  try {
+    const data = await chrome.storage.local.get(['recordingHistory']);
+    const history = data.recordingHistory || [];
+    
+    const newRecord = {
+      meetingId: meetingId || 'unknown',
+      sessionId: sessionId || 'unknown',
+      filename: filename || 'recording.webm',
+      downloadUrl: downloadUrl || '',
+      timestamp: Date.now()
+    };
+    
+    // De-duplicate: check if this session is already in history
+    if (!history.some(item => item.sessionId === newRecord.sessionId)) {
+      history.push(newRecord);
+      await chrome.storage.local.set({ recordingHistory: history });
+      console.log('[GMR] Saved recording to history:', newRecord.sessionId);
+    }
+  } catch (err) {
+    console.error('[GMR] Failed to save recording to history:', err);
+  }
+
   await chrome.storage.local.set({ lastDownloadUrl: downloadUrl, lastFilename: filename });
-  await broadcastToPopups({ type: 'RECORDING_SAVED_POPUP', downloadUrl, filename });
+  await broadcastToPopups({ type: 'RECORDING_SAVED_POPUP', downloadUrl, filename, meetingId, sessionId });
   sendResponse({ success: true });
 }
 

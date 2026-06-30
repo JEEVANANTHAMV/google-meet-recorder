@@ -75,6 +75,7 @@ function cacheElements() {
   els.btnStart = document.getElementById('btnStart');
   els.btnEnableMic = document.getElementById('btnEnableMic');
   els.micHint = document.getElementById('micHint');
+  els.btnOpenRecordings = document.getElementById('btnOpenRecordings');
 }
 
 function setupEventListeners() {
@@ -83,6 +84,13 @@ function setupEventListeners() {
 
   // Enable microphone capture (the permission prompt can only appear here, not in offscreen)
   if (els.btnEnableMic) els.btnEnableMic.addEventListener('click', handleEnableMic);
+
+  // Open recordings page
+  if (els.btnOpenRecordings) {
+    els.btnOpenRecordings.addEventListener('click', () => {
+      chrome.tabs.create({ url: chrome.runtime.getURL('recordings.html') });
+    });
+  }
 }
 
 async function loadState() {

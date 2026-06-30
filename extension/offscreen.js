@@ -130,8 +130,8 @@ async function startRecording(serverUrl, mId, token, streamId, captureMic) {
     }
 
     // 3) Build the recording stream: tab video + audio (tab audio = all participants, mixed with
-    //    mic if available), and replay meeting audio so tab capture doesn't mute the user's speakers.
-    stream = await buildRecordingStream(captureStream, micStream);
+    //    mic if available), and replay meeting audio so tab capture doesn't silence their speakers.
+    stream = await buildRecordingStream(captureStream, micStream, !!streamId);
 
     const tabAudioTracks = captureStream ? captureStream.getAudioTracks() : [];
     const isTabAudioMissing = tabAudioTracks.length === 0;
@@ -210,12 +210,12 @@ async function startRecording(serverUrl, mId, token, streamId, captureMic) {
 
 // Mix capture audio (all remote participants) + microphone (local voice) into a single track,
 // and replay the meeting audio to the user so tab capture doesn't silence their speakers.
-async function buildRecordingStream(capture, mic) {
+async function buildRecordingStream(capture, mic, isTabCapture) {
   const videoTracks = capture.getVideoTracks();
   const tabAudio = capture.getAudioTracks();
   const micAudio = mic ? mic.getAudioTracks() : [];
 
-  console.log('[GMR Offscreen] Audio sources -> tab:', tabAudio.length, 'mic:', micAudio.length);
+  console.log('[GMR Offscreen] Audio sources -> tab:', tabAudio.length, 'mic:', micAudio.length, 'isTabCapture:', isTabCapture);
 
   // No audio at all.
   if (tabAudio.length === 0 && micAudio.length === 0) {
@@ -228,13 +228,15 @@ async function buildRecordingStream(capture, mic) {
   // CASE A — no mic: record the RAW tab audio track (bulletproof: never affected by context state)
   // and use a context only to replay audio to the user.
   if (micAudio.length === 0) {
-    try {
-      playbackContext = new AudioContext();
-      await playbackContext.resume();
-      const tabSrc = playbackContext.createMediaStreamSource(new MediaStream(tabAudio));
-      tabSrc.connect(playbackContext.destination); // user keeps hearing the meeting
-    } catch (err) {
-      console.warn('[GMR Offscreen] Playback passthrough failed (recording still has audio):', err.message);
+    if (isTabCapture) {
+      try {
+        playbackContext = new AudioContext();
+        await playbackContext.resume();
+        const tabSrc = playbackContext.createMediaStreamSource(new MediaStream(tabAudio));
+        tabSrc.connect(playbackContext.destination); // user keeps hearing the meeting
+      } catch (err) {
+        console.warn('[GMR Offscreen] Playback passthrough failed (recording still has audio):', err.message);
+      }
     }
     return new MediaStream([...videoTracks, ...tabAudio]);
   }
@@ -248,7 +250,9 @@ async function buildRecordingStream(capture, mic) {
     if (tabAudio.length > 0) {
       const tabSrc = playbackContext.createMediaStreamSource(new MediaStream(tabAudio));
       tabSrc.connect(dest);                       // -> recorded
-      tabSrc.connect(playbackContext.destination); // -> user hears the meeting
+      if (isTabCapture) {
+        tabSrc.connect(playbackContext.destination); // -> user hears the meeting
+      }
     }
     const micSrc = playbackContext.createMediaStreamSource(new MediaStream(micAudio));
     micSrc.connect(dest);                          // -> recorded only (no echo)
@@ -284,8 +288,8 @@ async function stopRecording() {
     playbackContext = null;
   }
 
-  // Close WebSocket
-  closeWebSocket();
+  // Do NOT close WebSocket immediately here. It will be closed
+  // after receiving the 'recording_saved' confirmation from the server.
 
   recordingStartTime = null;
 
@@ -568,8 +572,11 @@ function handleWebSocketMessage(data) {
         chrome.runtime.sendMessage({
           type: 'RECORDING_SAVED',
           downloadUrl: message.downloadUrl,
-          filename: message.filename
+          filename: message.filename,
+          meetingId: message.meetingId,
+          sessionId: message.sessionId
         });
+        closeWebSocket();
         break;
       case 'status':
         console.log('[GMR Offscreen] Server status:', message);

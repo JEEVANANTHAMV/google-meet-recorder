@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>My Recordings — Google Meet Recorder</title>
+  <link rel="stylesheet" href="popup.css">
+  <style>
+    /* Override popup width restriction since this page opens in a full tab */
+    body {
+      width: 100%;
+      min-height: 100vh;
+      max-height: none;
+      overflow-y: auto;
+      background: #000;
+    }
+
+    .container {
+      max-width: 1000px;
+      margin: 40px auto;
+      padding: 0 20px;
+    }
+
+    .dashboard-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 30px;
+    }
+
+    .dashboard-title-group {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .dashboard-logo {
+      width: 32px;
+      height: 32px;
+      color: var(--color-rose);
+    }
+
+    .dashboard-title {
+      font-size: 24px;
+      font-weight: 700;
+      letter-spacing: -0.5px;
+      background: linear-gradient(135deg, var(--color-white) 30%, var(--color-rose) 100%);
+      -webkit-background-clip: text;
+      background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+
+    .table-container {
+      margin-top: 20px;
+      border: 1px solid var(--color-border);
+      border-radius: var(--radius-lg);
+      background: var(--color-glass-bg);
+      backdrop-filter: blur(40px);
+      -webkit-backdrop-filter: blur(40px);
+      overflow: hidden;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      text-align: left;
+    }
+
+    th, td {
+      padding: 16px 20px;
+      border-bottom: 1px solid var(--color-border);
+    }
+
+    th {
+      background: rgba(255, 255, 255, 0.02);
+      font-size: 12px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.8px;
+      color: var(--color-text-muted);
+    }
+
+    tr:last-child td {
+      border-bottom: none;
+    }
+
+    tr:hover td {
+      background: rgba(255, 255, 255, 0.01);
+    }
+
+    .col-meeting {
+      font-weight: 600;
+      color: var(--color-white);
+    }
+
+    .col-session {
+      font-family: var(--font-mono);
+      font-size: 13px;
+      color: var(--color-rose);
+      opacity: 0.9;
+    }
+
+    .col-date {
+      color: var(--color-text-muted);
+    }
+
+    .badge-status {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 10px;
+      border-radius: var(--radius-full);
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      background: rgba(16, 185, 129, 0.1);
+      color: var(--color-emerald);
+      border: 1px solid rgba(16, 185, 129, 0.2);
+    }
+
+    .btn-actions {
+      display: flex;
+      gap: 8px;
+    }
+
+    .btn-icon {
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid var(--color-border);
+      color: var(--color-white);
+      padding: 8px 14px;
+      border-radius: var(--radius-sm);
+      cursor: pointer;
+      font-weight: 600;
+      font-size: 13px;
+      transition: all 0.2s ease;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      text-decoration: none;
+    }
+
+    .btn-icon:hover {
+      background: var(--color-glass-bg-hover);
+      border-color: var(--color-border-hover);
+      transform: translateY(-1px);
+    }
+
+    .btn-icon.download {
+      background: var(--color-rose);
+      border-color: transparent;
+      color: var(--color-black);
+    }
+
+    .btn-icon.download:hover {
+      background: #ff859f;
+      color: var(--color-black);
+    }
+
+    .btn-icon.delete {
+      color: var(--color-red);
+    }
+
+    .btn-icon.delete:hover {
+      background: rgba(239, 68, 68, 0.1);
+      border-color: rgba(239, 68, 68, 0.2);
+    }
+
+    .empty-state {
+      padding: 60px 20px;
+      text-align: center;
+      color: var(--color-text-muted);
+    }
+
+    .empty-icon {
+      font-size: 48px;
+      margin-bottom: 16px;
+    }
+
+    .empty-title {
+      font-size: 18px;
+      font-weight: 600;
+      color: var(--color-white);
+      margin-bottom: 8px;
+    }
+
+    .empty-desc {
+      font-size: 14px;
+      max-width: 400px;
+      margin: 0 auto;
+      line-height: 1.5;
+    }
+
+    /* Sub-header actions */
+    .dashboard-actions {
+      display: flex;
+      gap: 12px;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <!-- Header -->
+    <header class="dashboard-header">
+      <div class="dashboard-title-group">
+        <!-- Mic/Recording Logo -->
+        <svg class="dashboard-logo" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/>
+          <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+          <line x1="12" y1="19" x2="12" y2="22"/>
+        </svg>
+        <h1 class="dashboard-title">My Recordings</h1>
+      </div>
+      <div class="dashboard-actions">
+        <button class="btn-icon delete" id="btnClearAll">Clear History</button>
+      </div>
+    </header>
+
+    <!-- Recordings List -->
+    <div class="table-container">
+      <table id="recordingsTable">
+        <thead>
+          <tr>
+            <th>Meeting ID</th>
+            <th>Session ID</th>
+            <th>Date & Time</th>
+            <th>Status</th>
+            <th style="text-align: right;">Actions</th>
+          </tr>
+        </thead>
+        <tbody id="recordingsList">
+          <!-- Populated dynamically -->
+        </tbody>
+      </table>
+      <div id="emptyState" class="empty-state hidden">
+        <div class="empty-icon">📁</div>
+        <div class="empty-title">No recordings found</div>
+        <div class="empty-desc">Recordings you capture on this device will be listed here for quick access and download.</div>
+      </div>
+    </div>
+  </div>
+
+  <script src="recordings.js"></script>
+</body>
+</html>

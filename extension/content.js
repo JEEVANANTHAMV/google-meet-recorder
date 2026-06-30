@@ -1289,6 +1289,7 @@
       className: 'gmr-warning-btn primary',
       onClick: () => {
         chrome.runtime.sendMessage({ type: 'STOP_RECORDING' });
+        chrome.storage.local.set({ forceDisplayCapture: true });
         dismissAudioWarning();
         showToast('Recording stopped. Please click "Start Recording" again and select "Share system audio" or "Also share tab audio".', 'info');
       }

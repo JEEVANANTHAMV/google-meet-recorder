@@ -105,7 +105,7 @@ body {
   color: var(--color-white);
 }
 
-.header-settings {
+.header-btn {
   width: 36px;
   height: 36px;
   border-radius: var(--radius-md);
@@ -119,17 +119,17 @@ body {
   transition: all 0.2s ease;
 }
 
-.header-settings:hover {
+.header-btn:hover {
   background: var(--color-glass-bg-hover);
   color: var(--color-white);
 }
 
-.header-settings:hover svg {
-  transform: rotate(90deg);
+.header-btn:hover svg {
+  transform: scale(1.1);
 }
 
-.header-settings svg {
-  transition: transform 0.3s ease;
+.header-btn svg {
+  transition: transform 0.2s ease;
 }
 
 /* ===== Content Area ===== */
