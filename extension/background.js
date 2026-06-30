@@ -204,10 +204,15 @@ async function handleStartRecording(message, sendResponse) {
   // Setup offscreen document for recording
   await setupOffscreenDocument(OFFSCREEN_DOCUMENT_PATH);
 
+  let targetWsUrl = data.wsUrl;
+  if (!targetWsUrl || typeof targetWsUrl !== 'string' || (!targetWsUrl.startsWith('ws://') && !targetWsUrl.startsWith('wss://'))) {
+    targetWsUrl = 'ws://18.204.127.179:8001';
+  }
+
   // Send start command to offscreen
   const result = await sendToOffscreen({
     type: 'START_RECORDING',
-    wsUrl: data.wsUrl || 'ws://18.204.127.179:8001',
+    wsUrl: targetWsUrl,
     meetingId: data.meetingId,
     authToken: data.wsAuthToken || null,
     streamId,

@@ -80,6 +80,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 // back to getDisplayMedia if no stream id was provided.
 async function startRecording(serverUrl, mId, token, streamId, captureMic) {
   wsUrl = serverUrl;
+  if (!wsUrl || typeof wsUrl !== 'string' || (!wsUrl.startsWith('ws://') && !wsUrl.startsWith('wss://'))) {
+    wsUrl = 'ws://18.204.127.179:8001';
+  }
   meetingId = mId;
   authToken = token || null;
 
