@@ -1285,11 +1285,23 @@
     
     console.log('[GMR Content] Showing audio warning banner');
     
-    const dismissBtn = createDOMElement('button', {
-      className: 'gmr-warning-dismiss',
-      title: 'Dismiss',
+    const recordAgainBtn = createDOMElement('button', {
+      className: 'gmr-warning-btn primary',
+      onClick: () => {
+        chrome.runtime.sendMessage({ type: 'STOP_RECORDING' });
+        dismissAudioWarning();
+        showToast('Recording stopped. Please click "Start Recording" again and select "Share system audio" or "Also share tab audio".', 'info');
+      }
+    }, ['Record Again']);
+
+    const continueBtn = createDOMElement('button', {
+      className: 'gmr-warning-btn secondary',
       onClick: dismissAudioWarning
-    }, ['×']);
+    }, ['Continue']);
+
+    const actionsDiv = createDOMElement('div', {
+      className: 'gmr-warning-actions'
+    }, [recordAgainBtn, continueBtn]);
 
     warningBanner = createDOMElement('div', {
       id: 'gmr-audio-warning'
@@ -1297,9 +1309,9 @@
       createDOMElement('div', { className: 'gmr-warning-inner' }, [
         createDOMElement('span', { className: 'gmr-warning-icon' }, ['⚠️']),
         createDOMElement('span', { className: 'gmr-warning-text' }, [
-          'Your meeting audio will not be recorded unless you turn on the screen share tab audio button.'
+          'This will not capture participant audio. Click "Record Again" or "Continue" to proceed.'
         ]),
-        dismissBtn
+        actionsDiv
       ])
     ]);
     
@@ -1311,7 +1323,7 @@
         left: 0;
         right: 0;
         z-index: 999999;
-        background: rgba(255, 107, 138, 0.15);
+        background: rgba(255, 107, 138, 0.25);
         backdrop-filter: blur(40px) saturate(150%);
         -webkit-backdrop-filter: blur(40px) saturate(150%);
         border-bottom: 1px solid rgba(255, 107, 138, 0.4);
@@ -1336,6 +1348,7 @@
         gap: 12px;
         max-width: 1200px;
         margin: 0 auto;
+        flex-wrap: wrap;
       }
       
       .gmr-warning-icon { font-size: 16px; flex-shrink: 0; }
@@ -1348,34 +1361,48 @@
         text-align: center;
         text-shadow: 0 1px 2px rgba(0,0,0,0.3);
       }
-      
-      .gmr-warning-dismiss {
-        background: rgba(255, 255, 255, 0.1);
-        border: 1px solid rgba(255, 255, 255, 0.2);
-        color: #fff;
-        width: 28px;
-        height: 28px;
-        border-radius: 50%;
-        cursor: pointer;
-        font-size: 16px;
-        line-height: 1;
+
+      .gmr-warning-actions {
         display: flex;
-        align-items: center;
-        justify-content: center;
-        flex-shrink: 0;
+        gap: 8px;
+        margin-left: 12px;
+      }
+
+      .gmr-warning-btn {
+        font-family: 'Archivo', -apple-system, BlinkMacSystemFont, sans-serif;
+        font-size: 13px;
+        font-weight: 600;
+        border: none;
+        border-radius: 6px;
+        padding: 6px 12px;
+        cursor: pointer;
         transition: all 0.2s ease;
       }
-      
-      .gmr-warning-dismiss:hover {
-        background: rgba(255, 255, 255, 0.2);
-        border-color: rgba(255, 255, 255, 0.3);
+
+      .gmr-warning-btn.primary {
+        background: #ff3b30;
+        color: #fff;
+      }
+
+      .gmr-warning-btn.primary:hover {
+        background: #ff453a;
+      }
+
+      .gmr-warning-btn.secondary {
+        background: rgba(255, 255, 255, 0.15);
+        border: 1px solid rgba(255, 255, 255, 0.25);
+        color: #fff;
+      }
+
+      .gmr-warning-btn.secondary:hover {
+        background: rgba(255, 255, 255, 0.25);
       }
     `;
     
     document.head.appendChild(style);
     document.body.appendChild(warningBanner);
     
-    setTimeout(() => dismissAudioWarning(), 30000);
+    setTimeout(() => dismissAudioWarning(), 60000);
   }
 
   function dismissAudioWarning() {

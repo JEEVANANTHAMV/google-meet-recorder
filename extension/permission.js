@@ -13,8 +13,11 @@ async function requestMic() {
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
     stream.getTracks().forEach(t => t.stop()); // we only needed the permission grant
     await chrome.storage.local.set({ micEnabled: true });
-    statusEl.textContent = '✅ Microphone enabled! Your voice will be included in recordings. You can close this tab.';
+    statusEl.textContent = '✅ Microphone enabled! Your voice will be included in recordings. Closing this tab...';
     statusEl.className = 'ok';
+    setTimeout(() => {
+      window.close();
+    }, 1500);
   } catch (err) {
     await chrome.storage.local.set({ micEnabled: false });
     statusEl.textContent = '❌ Microphone permission was not granted (' + err.name + '). Allow it (address-bar icon or chrome settings), then click “Request again”.';

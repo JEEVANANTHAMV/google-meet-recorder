@@ -60,7 +60,6 @@ function cacheElements() {
   
   els.wsDot = document.getElementById('wsDot');
   els.wsStatusText = document.getElementById('wsStatusText');
-  els.wsUrl = document.getElementById('wsUrl');
   els.wsLatency = document.getElementById('wsLatency');
   els.wsUptime = document.getElementById('wsUptime');
   
@@ -76,13 +75,6 @@ function cacheElements() {
   els.btnStart = document.getElementById('btnStart');
   els.btnEnableMic = document.getElementById('btnEnableMic');
   els.micHint = document.getElementById('micHint');
-  els.btnSettings = document.getElementById('btnSettings');
-  els.settingsOverlay = document.getElementById('settingsOverlay');
-  els.btnCloseSettings = document.getElementById('btnCloseSettings');
-  els.wsUrlInput = document.getElementById('wsUrlInput');
-  els.btnSaveSettings = document.getElementById('btnSaveSettings');
-  els.settingsError = document.getElementById('settingsError');
-  els.settingsSuccess = document.getElementById('settingsSuccess');
 }
 
 function setupEventListeners() {
@@ -91,23 +83,6 @@ function setupEventListeners() {
 
   // Enable microphone capture (the permission prompt can only appear here, not in offscreen)
   if (els.btnEnableMic) els.btnEnableMic.addEventListener('click', handleEnableMic);
-  
-  // Settings
-  els.btnSettings.addEventListener('click', () => {
-    els.wsUrlInput.value = state.wsUrl;
-    els.settingsOverlay.classList.add('visible');
-  });
-  
-  els.btnCloseSettings.addEventListener('click', () => {
-    els.settingsOverlay.classList.remove('visible');
-  });
-  
-  els.btnSaveSettings.addEventListener('click', handleSaveSettings);
-  
-  // Enter key in settings
-  els.wsUrlInput.addEventListener('keypress', (e) => {
-    if (e.key === 'Enter') handleSaveSettings();
-  });
 }
 
 async function loadState() {
@@ -254,42 +229,6 @@ function renderMicState() {
   }
 }
 
-async function handleSaveSettings() {
-  const url = els.wsUrlInput.value.trim();
-  
-  if (!url) {
-    els.settingsError.textContent = 'Please enter a WebSocket URL';
-    els.settingsError.classList.remove('hidden');
-    return;
-  }
-  
-  // Basic URL validation
-  if (!url.startsWith('ws://') && !url.startsWith('wss://')) {
-    els.settingsError.textContent = 'URL must start with ws:// or wss://';
-    els.settingsError.classList.remove('hidden');
-    return;
-  }
-  
-  els.settingsError.classList.add('hidden');
-  
-  try {
-    await sendMessage({ type: 'UPDATE_SETTINGS', wsUrl: url });
-    state.wsUrl = url;
-    els.wsUrl.textContent = url;
-    
-    els.settingsSuccess.textContent = 'Settings saved!';
-    els.settingsSuccess.classList.remove('hidden');
-    
-    setTimeout(() => {
-      els.settingsOverlay.classList.remove('visible');
-      els.settingsSuccess.classList.add('hidden');
-    }, 1500);
-    
-  } catch (err) {
-    els.settingsError.textContent = 'Failed to save settings';
-    els.settingsError.classList.remove('hidden');
-  }
-}
 
 // ==================== RENDERING ====================
 
@@ -396,8 +335,7 @@ function renderWebSocketStatus() {
     els.wsUptime.textContent = '--:--:--';
     wsUptimeStart = null;
   }
-  
-  els.wsUrl.textContent = state.wsUrl;
+
 }
 
 function renderMeetingInfo() {

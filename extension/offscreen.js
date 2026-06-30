@@ -133,11 +133,16 @@ async function startRecording(serverUrl, mId, token, streamId, captureMic) {
     //    mic if available), and replay meeting audio so tab capture doesn't mute the user's speakers.
     stream = await buildRecordingStream(captureStream, micStream);
 
-    const audioTracks = stream.getAudioTracks();
-    if (audioTracks.length === 0) {
-      console.warn('[GMR Offscreen] No audio track in recording stream!');
+    const tabAudioTracks = captureStream ? captureStream.getAudioTracks() : [];
+    const isTabAudioMissing = tabAudioTracks.length === 0;
+
+    if (isTabAudioMissing) {
+      console.warn('[GMR Offscreen] No tab/system audio track in capture stream!');
       chrome.runtime.sendMessage({ type: 'RECORDING_STATUS', status: 'recording', audioMissing: true });
-    } else {
+    }
+
+    const audioTracks = stream.getAudioTracks();
+    if (audioTracks.length > 0) {
       monitorAudioVolume(audioTracks[0]);
     }
 

@@ -18,12 +18,7 @@
       </svg>
       <span class="header-title">Google Meet Recorder</span>
     </div>
-    <button class="header-settings" id="btnSettings" title="Settings">
-      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-        <circle cx="12" cy="12" r="3"/>
-        <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1Z"/>
-      </svg>
-    </button>
+    </div>
   </header>
 
   <!-- Main Content -->
@@ -61,7 +56,6 @@
           <div class="ws-dot" id="wsDot"></div>
           <span class="ws-status-text" id="wsStatusText">Disconnected</span>
         </div>
-        <div class="ws-url" id="wsUrl">ws://18.204.127.179:8001</div>
         <div class="ws-metrics">
           <span class="ws-latency" id="wsLatency">--ms</span>
           <span class="ws-uptime" id="wsUptime">--:--:--</span>
@@ -121,22 +115,6 @@
     </div>
   </main>
 
-  <!-- Settings Overlay -->
-  <div class="settings-overlay" id="settingsOverlay">
-    <div class="settings-header">
-      <h2 class="settings-title">Settings</h2>
-      <button class="settings-close" id="btnCloseSettings">&times;</button>
-    </div>
-    <div class="settings-body">
-      <div class="form-group">
-        <label class="form-label">WebSocket Server URL</label>
-        <input type="text" class="form-input" id="wsUrlInput" placeholder="ws://your-server:port" value="ws://18.204.127.179:8001">
-      </div>
-      <button class="btn btn-primary btn-full" id="btnSaveSettings">Save & Connect</button>
-      <div class="error-text hidden" id="settingsError"></div>
-      <div class="success-text hidden" id="settingsSuccess"></div>
-    </div>
-  </div>
 
   <!-- Footer -->
   <footer class="footer">
