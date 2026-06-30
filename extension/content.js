@@ -31,7 +31,7 @@
   const RECONCILE_INTERVAL_MS = 2000; // how often we diff the DOM against the cache
 
   let gmrState = {
-    wsUrl: 'ws://164.52.198.68:8001',
+    wsUrl: 'ws://18.204.127.179:8001',
     isRecording: false,
     isPaused: false,
     meetingId: null,

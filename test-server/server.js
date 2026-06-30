@@ -29,7 +29,7 @@ const CONFIG = {
   projectId: process.env.GCS_PROJECT_ID || undefined,
   keyFilename: process.env.GOOGLE_APPLICATION_CREDENTIALS || path.join(__dirname, 'Service-Account.json'),
   localRoot: process.env.LOCAL_STORAGE_DIR || path.join(__dirname, 'recordings'),
-  publicBaseUrl: process.env.PUBLIC_BASE_URL || `http://164.52.198.68:${process.env.PORT || '8001'}`,
+  publicBaseUrl: process.env.PUBLIC_BASE_URL || `http://18.204.127.179:${process.env.PORT || '8001'}`,
   signedUrlExpiresDays: parseInt(process.env.SIGNED_URL_EXPIRES_DAYS || '7', 10),
   selfCheck: process.env.STORAGE_SELFCHECK !== 'false',
   // WS hardening

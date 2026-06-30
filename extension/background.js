@@ -7,7 +7,7 @@ let creatingOffscreen = false;
 // Initialize default settings on install
 chrome.runtime.onInstalled.addListener(() => {
   chrome.storage.local.set({
-    wsUrl: 'ws://164.52.198.68:8001',
+    wsUrl: 'ws://18.204.127.179:8001',
     isRecording: false,
     meetingId: null,
     recordingStartTime: null,
@@ -207,7 +207,7 @@ async function handleStartRecording(message, sendResponse) {
   // Send start command to offscreen
   const result = await sendToOffscreen({
     type: 'START_RECORDING',
-    wsUrl: data.wsUrl || 'ws://164.52.198.68:8001',
+    wsUrl: data.wsUrl || 'ws://18.204.127.179:8001',
     meetingId: data.meetingId,
     authToken: data.wsAuthToken || null,
     streamId,
