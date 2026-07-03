@@ -2,6 +2,12 @@
 
 A Chrome extension that records Google Meet sessions, tracks participants, captures live transcripts, and streams everything in real-time to a WebSocket server.
 
+> **BETA ERP integration:** this recorder replaces the external `meet.innosynth.org` meeting-bot. It
+> registers scheduled classes, enforces **domain binding** (internal `@mybeta.ca` records freely;
+> external users need the access key `InnoSynth@12`), pushes finished sessions to the ERP, and emails
+> faculty if a scheduled class isn't recorded within 10 minutes. See **[INTEGRATION.md](INTEGRATION.md)**
+> for the end-to-end flow, matched config, and rehosting steps.
+
 ---
 
 ## Quick Start

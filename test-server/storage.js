@@ -213,7 +213,7 @@ function groupSessions(files) {
     const meetingId = parts[1];
     const sessionId = parts[2];
     const artifact = parts.slice(3).join('/');
-    if (meetingId === '_healthcheck') continue;
+    if (meetingId === '_healthcheck' || meetingId === '_registry') continue;
     const key = `${meetingId}/${sessionId}`;
     if (!sessions.has(key)) sessions.set(key, { meetingId, sessionId, files: {} });
     sessions.get(key).files[artifact] = { size: f.size, updated: f.updated };

@@ -8,10 +8,14 @@
     "tabCapture",
     "offscreen",
     "storage",
-    "scripting"
+    "scripting",
+    "identity",
+    "identity.email"
   ],
   "host_permissions": [
-    "https://meet.google.com/*"
+    "https://meet.google.com/*",
+    "http://18.204.127.179/*",
+    "https://18.204.127.179/*"
   ],
   "action": {
     "default_popup": "popup.html",

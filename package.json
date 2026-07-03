@@ -1,0 +1,13 @@
+{
+  "name": "google-meet-recorder",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Google Meet Recorder — Chrome extension + recorder server (WebSocket ingest, HTTP API, schedule registry, missed-recording watchdog).",
+  "scripts": {
+    "install:server": "npm --prefix test-server install",
+    "postinstall": "npm --prefix test-server install",
+    "start": "npm --prefix test-server start",
+    "dev": "npm --prefix test-server run dev",
+    "setup-gcs": "npm --prefix test-server run setup-gcs"
+  }
+}

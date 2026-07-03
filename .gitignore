@@ -13,3 +13,10 @@ test-server/recordings/
 # Logs / OS junk
 *.log
 .DS_Store
+
+test-server/.rootsmoke
+test-server/.rootsmoke/meetings
+test-server/.rootsmoke/meetings/_registry
+test-server/.rootsmoke/meetings/_registry/schedules
+test-server/.smoke-recordings
+test-server/.smoke-recordings/meetings

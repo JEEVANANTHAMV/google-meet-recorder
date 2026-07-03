@@ -17,6 +17,9 @@ const WebSocket = require('ws');
 
 const logger = require('./logger');
 const { createStorage, objectPath, safeSegment } = require('./storage');
+const { createScheduleRegistry } = require('./schedules');
+const { createMailer, missedRecordingEmail } = require('./mailer');
+const { createBackendNotifier } = require('./backendNotifier');
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -38,12 +41,39 @@ const CONFIG = {
   authToken: process.env.AUTH_TOKEN || '',
   heartbeatIntervalMs: parseInt(process.env.WS_HEARTBEAT_MS || '15000', 10),
   flushIntervalMs: parseInt(process.env.EVENT_FLUSH_MS || '5000', 10),
-  corsOrigin: process.env.CORS_ORIGIN || '*'
+  corsOrigin: process.env.CORS_ORIGIN || '*',
+
+  // ---- Domain binding / access control ----
+  // Internal users (email in this domain) may record any meeting. Anyone else must supply the key.
+  allowedEmailDomain: (process.env.ALLOWED_EMAIL_DOMAIN || 'mybeta.ca').toLowerCase().replace(/^@/, ''),
+  externalAccessKey: process.env.EXTERNAL_ACCESS_KEY || 'InnoSynth@12',
+  // API key the ERP presents when registering/removing schedules.
+  scheduleApiKey: process.env.SCHEDULE_API_KEY || '',
+
+  // ---- Backend push (ERP webhook) ----
+  backendWebhookUrl: process.env.BACKEND_WEBHOOK_URL || '',
+  backendWebhookSecret: process.env.BACKEND_WEBHOOK_SECRET || '',
+
+  // ---- Missed-recording watchdog ----
+  missedGraceMinutes: parseInt(process.env.MISSED_RECORDING_GRACE_MIN || '10', 10),
+  watchdogIntervalMs: parseInt(process.env.WATCHDOG_INTERVAL_MS || '60000', 10),
+  adminAlertEmails: (process.env.ADMIN_ALERT_EMAILS || '').split(',').map(s => s.trim()).filter(Boolean),
+
+  // ---- SMTP (copied from ERP / Base codebase Constants) ----
+  smtpEnabled: process.env.SMTP_ENABLED !== 'false',
+  smtpHost: process.env.SMTP_HOST || '',
+  smtpPort: parseInt(process.env.SMTP_PORT || '587', 10),
+  smtpUser: process.env.SMTP_USERNAME || '',
+  smtpPass: process.env.SMTP_PASSWORD || '',
+  senderEmail: process.env.SENDER_EMAIL || 'BETA HIVE <no-reply@mybeta.ca>'
 };
 
-const SERVER_VERSION = '2.0.0';
+const SERVER_VERSION = '3.0.0';
 
 const storage = createStorage(CONFIG);
+const registry = createScheduleRegistry(storage, CONFIG, logger);
+const mailer = createMailer(CONFIG);
+const backendNotifier = createBackendNotifier(CONFIG);
 
 // Active sessions, keyed by sessionId, plus lookups by socket and by meeting.
 const sessions = new Map();        // sessionId -> session
@@ -187,11 +217,64 @@ async function finalizeSession(session, reason) {
     transcriptLines: session.transcript.length,
     durationSec: ((Date.now() - session.startTimeMs) / 1000).toFixed(1)
   }, 'Session finalized');
+
+  // Link + push to the ERP (fire-and-forget) whenever the session captured anything meaningful.
+  pushSessionToBackend(session).catch(err =>
+    logger.error({ err: err.message, sessionId: session.id }, 'Backend push failed'));
+}
+
+// Match the session to its scheduled occurrence and push the full result to the ERP webhook.
+async function pushSessionToBackend(session) {
+  if (session.notified) return;
+  const hasData = session.chunkCount > 0 || session.participants.length > 0 || session.transcript.length > 0;
+  if (!hasData) return;
+  session.notified = true;
+
+  const occ = registry.markRecorded(session.meetingId, session.id, session.startedAt);
+
+  let signedUrl = null;
+  if (session.chunkCount > 0) {
+    try {
+      signedUrl = await storage.getRecordingSignedUrl(session.meetingId, session.id, CONFIG.signedUrlExpiresDays);
+    } catch (err) {
+      logger.warn({ err: err.message, sessionId: session.id }, 'Could not mint signed URL for backend push');
+    }
+  }
+
+  await backendNotifier.notifySessionComplete({
+    session,
+    occ,
+    recordingObject: session.chunkCount > 0 ? objectPath(session.meetingId, session.id, 'recording.webm') : null,
+    bucket: storage.bucketName,
+    signedUrl,
+    roster: buildRoster(session.participants),
+    transcript: session.transcript
+  });
 }
 
 // ---------------------------------------------------------------------------
 // WebSocket message handling
 // ---------------------------------------------------------------------------
+// Decide whether a recorder is allowed to stream this meeting.
+//   - Internal user  : email domain === ALLOWED_EMAIL_DOMAIN  -> allowed
+//   - Bound meeting   : the meeting code is registered by the ERP -> allowed (any user)
+//   - External user   : must supply the correct EXTERNAL_ACCESS_KEY
+// Returns { allowed, reason } (reason is machine-friendly for logging + client display).
+function authorizeRecorder(message, meetingId) {
+  const email = (message.email || '').trim().toLowerCase();
+  const domain = email.includes('@') ? email.split('@').pop() : '';
+  if (domain && domain === CONFIG.allowedEmailDomain) {
+    return { allowed: true, reason: 'internal-domain' };
+  }
+  if (registry.isBound(meetingId)) {
+    return { allowed: true, reason: 'bound-meeting' };
+  }
+  if (message.accessKey && message.accessKey === CONFIG.externalAccessKey) {
+    return { allowed: true, reason: 'external-key' };
+  }
+  return { allowed: false, reason: 'external-key-required' };
+}
+
 function handleAuth(message, ws, remoteAddress) {
   if (CONFIG.authToken && message.token !== CONFIG.authToken) {
     logger.warn({ remoteAddress, meetingId: message.meetingId }, 'Auth rejected: bad token');
@@ -202,6 +285,21 @@ function handleAuth(message, ws, remoteAddress) {
 
   const meetingId = safeSegment(message.meetingId || 'unknown');
   const clientType = message.clientType || 'recorder';
+
+  // Domain-binding / external-key gate (recorders only).
+  if (clientType === 'recorder') {
+    const auth = authorizeRecorder(message, meetingId);
+    if (!auth.allowed) {
+      logger.warn({ remoteAddress, meetingId, email: message.email }, 'Auth rejected: external key required');
+      ws.send(JSON.stringify({
+        type: 'status', ok: false, code: 'ACCESS_KEY_REQUIRED',
+        message: 'This meeting is not bound to your organization. Enter the access key to record.'
+      }));
+      ws.close(4003, 'Access key required');
+      return;
+    }
+    message._authReason = auth.reason;
+  }
 
   // Connection limit: refuse a second concurrent recorder for the same meeting (prevents
   // duplicate uploads). A reconnect after the old socket closed is fine — that session is gone.
@@ -233,7 +331,9 @@ function handleAuth(message, ws, remoteAddress) {
     flushTimer: null,
     dirty: { participants: false, transcript: false, meta: true },
     ws,
-    remoteAddress
+    remoteAddress,
+    email: (message.email || '').trim() || null,
+    authReason: message._authReason || null
   };
 
   sessions.set(session.id, session);
@@ -366,7 +466,8 @@ function sendJson(res, status, body) {
   res.writeHead(status, {
     'Content-Type': 'application/json',
     'Access-Control-Allow-Origin': CONFIG.corsOrigin,
-    'Access-Control-Allow-Methods': 'GET, OPTIONS',
+    'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Api-Key',
     'Cache-Control': 'no-cache'
   });
   res.end(payload);
@@ -428,8 +529,87 @@ async function readArtifact(meetingId, sessionId, kind) {
   return storage.readJSON(meetingId, sessionId, kind === 'transcript' ? 'transcript.json' : 'participants.json');
 }
 
+function readBody(req, maxBytes = 2 * 1024 * 1024) {
+  return new Promise((resolve, reject) => {
+    let data = '';
+    let size = 0;
+    req.on('data', (c) => {
+      size += c.length;
+      if (size > maxBytes) { reject(new Error('Body too large')); req.destroy(); return; }
+      data += c;
+    });
+    req.on('end', () => resolve(data));
+    req.on('error', reject);
+  });
+}
+
+// Schedule registry API: the ERP registers/removes occurrences (API-key protected); the extension
+// does an unauthenticated lookup to learn whether a meeting is domain-bound.
+async function handleSchedulesApi(req, res, parsed, parts) {
+  const sub = parts[1];
+
+  // --- Public: extension lookup ---
+  if (sub === 'lookup' && req.method === 'GET') {
+    const meetingId = parsed.searchParams.get('meetingId');
+    const email = (parsed.searchParams.get('email') || '').trim().toLowerCase();
+    if (!meetingId) return sendJson(res, 400, { error: 'meetingId required' });
+    const occ = registry.lookup(meetingId);
+    const bound = !!occ;
+    const domain = email.includes('@') ? email.split('@').pop() : '';
+    const internal = !!domain && domain === CONFIG.allowedEmailDomain;
+    return sendJson(res, 200, {
+      meetingId,
+      bound,
+      internal,
+      requiresKey: !bound && !internal,     // external user on an unregistered meeting -> needs key
+      autoRecord: occ ? occ.autoRecord : false,
+      allowedDomain: CONFIG.allowedEmailDomain,
+      // Never leak faculty email to the browser.
+      meeting: occ ? {
+        batchName: occ.batchName, facultyName: occ.facultyName,
+        startAt: occ.startAt, endAt: occ.endAt,
+        scheduleId: occ.scheduleId, splitScheduleId: occ.splitScheduleId
+      } : null
+    });
+  }
+
+  // --- Everything else requires the ERP API key (when configured) ---
+  if (CONFIG.scheduleApiKey && req.headers['x-api-key'] !== CONFIG.scheduleApiKey) {
+    return sendJson(res, 401, { error: 'Invalid or missing X-Api-Key' });
+  }
+
+  if (!sub && req.method === 'GET') {
+    const all = registry.all();
+    return sendJson(res, 200, { count: all.length, occurrences: all });
+  }
+
+  if (!sub && req.method === 'POST') {
+    let body;
+    try { body = JSON.parse((await readBody(req)) || '{}'); }
+    catch (e) { return sendJson(res, 400, { error: 'Invalid JSON body' }); }
+    const list = Array.isArray(body) ? body : (Array.isArray(body.occurrences) ? body.occurrences : [body]);
+    const saved = registry.upsertMany(list);
+    return sendJson(res, 200, { ok: true, upserted: saved.length });
+  }
+
+  if (req.method === 'DELETE') {
+    const target = parts[2] && decodeURIComponent(parts[2]);
+    if (sub === 'schedule' && target) return sendJson(res, 200, { ok: true, removed: registry.removeBySchedule(target) });
+    if (sub === 'split' && target) return sendJson(res, 200, { ok: true, removed: registry.removeBySplit(target) });
+    if (sub === 'meeting' && target) return sendJson(res, 200, { ok: true, removed: registry.removeByMeeting(target) });
+    return sendJson(res, 400, { error: 'DELETE /api/schedules/{schedule|split|meeting}/:id' });
+  }
+
+  return sendJson(res, 404, { error: 'Not found' });
+}
+
 async function handleApi(req, res, parsed) {
   const parts = parsed.pathname.replace(/^\/api\/?/, '').split('/').filter(Boolean);
+
+  // /api/schedules[...] — ERP registration + extension lookup
+  if (parts[0] === 'schedules') {
+    return handleSchedulesApi(req, res, parsed, parts);
+  }
 
   // GET /api/health
   if (parts[0] === 'health' && parts.length === 1) {
@@ -483,6 +663,8 @@ async function handleApi(req, res, parsed) {
       }
       return sendJson(res, 200, {
         meetingId, sessionId: session.sessionId, url,
+        object: objectPath(meetingId, session.sessionId, 'recording.webm'),
+        bucket: storage.bucketName,
         size: session.recordingSize,
         expiresAt: new Date(Date.now() + CONFIG.signedUrlExpiresDays * 86400000).toISOString()
       });
@@ -533,8 +715,8 @@ const httpServer = http.createServer((req, res) => {
   if (req.method === 'OPTIONS') {
     res.writeHead(204, {
       'Access-Control-Allow-Origin': CONFIG.corsOrigin,
-      'Access-Control-Allow-Methods': 'GET, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type, Authorization'
+      'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Api-Key'
     });
     return res.end();
   }
@@ -548,7 +730,11 @@ const httpServer = http.createServer((req, res) => {
         'GET /api/meetings/:meetingId',
         'GET /api/meetings/:meetingId/recording[?sessionId=&download=1]',
         'GET /api/meetings/:meetingId/transcript[?sessionId=]',
-        'GET /api/meetings/:meetingId/participants[?sessionId=]'
+        'GET /api/meetings/:meetingId/participants[?sessionId=]',
+        'GET /api/schedules/lookup?meetingId=&email=   (public — extension binding check)',
+        'GET /api/schedules                            (X-Api-Key)',
+        'POST /api/schedules                           (X-Api-Key — register occurrences)',
+        'DELETE /api/schedules/{schedule|split|meeting}/:id (X-Api-Key)'
       ]
     });
   }
@@ -636,10 +822,36 @@ const heartbeat = setInterval(() => {
 wss.on('close', () => clearInterval(heartbeat));
 
 // ---------------------------------------------------------------------------
+// Missed-recording watchdog: email the faculty (cc admins) when a scheduled class starts and no
+// recording data arrives within the grace window. Runs on an interval; each occurrence is emailed
+// at most once.
+// ---------------------------------------------------------------------------
+let watchdogTimer = null;
+
+async function runMissedRecordingWatchdog() {
+  try {
+    const due = registry.dueForMissedEmail(CONFIG.missedGraceMinutes);
+    for (const occ of due) {
+      const { subject, html } = missedRecordingEmail(occ, CONFIG.missedGraceMinutes);
+      const cc = Array.from(new Set([...(occ.adminEmails || []), ...CONFIG.adminAlertEmails]))
+        .filter(a => a && a !== occ.facultyEmail);
+      const result = await mailer.send({ to: occ.facultyEmail, cc, subject, html });
+      // Mark emailed even if the mailer is disabled so we don't reprocess this occurrence every tick.
+      registry.markMissedEmailed(occ);
+      logger.info({ meetingId: occ.meetingId, faculty: occ.facultyEmail, cc, sent: result.sent },
+        'Missed-recording alert processed');
+    }
+  } catch (err) {
+    logger.error({ err: err.message }, 'Missed-recording watchdog error');
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Startup + graceful shutdown
 // ---------------------------------------------------------------------------
 async function start() {
-  logger.info({ backend: CONFIG.backend, bucket: CONFIG.bucketName }, 'Starting GMeet Recorder server');
+  logger.info({ backend: CONFIG.backend, bucket: CONFIG.bucketName, allowedDomain: CONFIG.allowedEmailDomain },
+    'Starting GMeet Recorder server');
   if (CONFIG.selfCheck) {
     try {
       await storage.init();
@@ -650,8 +862,13 @@ async function start() {
       process.exit(1);
     }
   }
+  await registry.init();
+  watchdogTimer = setInterval(runMissedRecordingWatchdog, CONFIG.watchdogIntervalMs);
+  logger.info({ graceMin: CONFIG.missedGraceMinutes, intervalMs: CONFIG.watchdogIntervalMs },
+    'Missed-recording watchdog started');
   httpServer.listen(CONFIG.port, CONFIG.host, () => {
-    logger.info({ host: CONFIG.host, port: CONFIG.port, publicBaseUrl: CONFIG.publicBaseUrl },
+    logger.info({ host: CONFIG.host, port: CONFIG.port, publicBaseUrl: CONFIG.publicBaseUrl,
+      backendPush: backendNotifier.enabled, mailer: mailer.enabled },
       'Server listening (WebSocket + HTTP API)');
   });
 }
@@ -662,6 +879,8 @@ async function shutdown(signal) {
   shuttingDown = true;
   logger.info({ signal, activeSessions: sessions.size }, 'Graceful shutdown: draining sessions');
   clearInterval(heartbeat);
+  if (watchdogTimer) clearInterval(watchdogTimer);
+  await registry.flush();
 
   // Stop accepting new connections, then finalize in-flight sessions (flush GCS uploads).
   wss.close();

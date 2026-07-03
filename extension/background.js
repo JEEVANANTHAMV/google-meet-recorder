@@ -4,20 +4,53 @@
 const OFFSCREEN_DOCUMENT_PATH = 'offscreen.html';
 let creatingOffscreen = false;
 
+// Server endpoints. The recorder speaks WebSocket (ws) for streaming and HTTP (api) for the
+// schedule-binding lookup. Both point at the same host:port.
+const DEFAULT_WS_URL = 'ws://18.204.127.179:8001';
+const DEFAULT_API_BASE = 'http://18.204.127.179:8001';
+
 // Initialize default settings on install
 chrome.runtime.onInstalled.addListener(() => {
   chrome.storage.local.set({
-    wsUrl: 'ws://18.204.127.179:8001',
+    wsUrl: DEFAULT_WS_URL,
+    apiBaseUrl: DEFAULT_API_BASE,
+    accessKey: null,          // external-user access key (InnoSynth@12), entered on unbound meetings
+    userEmail: null,          // signed-in Chrome account email (for domain binding)
     isRecording: false,
     meetingId: null,
     recordingStartTime: null,
     totalParticipants: 0,
     activeParticipants: 0,
     transcriptLines: [],
-    activityLog: []
+    activityLog: [],
+    bindingByMeeting: {}
   });
   console.log('[GMR] Extension installed, defaults set');
+  refreshUserEmail();
 });
+
+// Resolve the signed-in Chrome profile email (used to decide domain binding). Requires the
+// "identity"/"identity.email" permissions. Cached in storage; refreshed on startup.
+function refreshUserEmail() {
+  try {
+    if (!chrome.identity || !chrome.identity.getProfileUserInfo) return;
+    chrome.identity.getProfileUserInfo({ accountStatus: 'ANY' }, (info) => {
+      if (chrome.runtime.lastError) return;
+      if (info && info.email) {
+        chrome.storage.local.set({ userEmail: info.email });
+        console.log('[GMR] Chrome account email resolved:', info.email);
+      }
+    });
+  } catch (e) {
+    // Older Chrome signatures take no options arg.
+    try {
+      chrome.identity.getProfileUserInfo((info) => {
+        if (info && info.email) chrome.storage.local.set({ userEmail: info.email });
+      });
+    } catch (_) { /* ignore */ }
+  }
+}
+refreshUserEmail();
 
 // Check if offscreen document exists
 async function hasOffscreenDocument() {
@@ -119,6 +152,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         case 'MEETING_DETECTED':
           await handleMeetingDetected(message, sender, sendResponse);
           break;
+        case 'SCHEDULE_LOOKUP':
+          await handleScheduleLookup(message, sendResponse);
+          break;
+        case 'SET_ACCESS_KEY':
+          await chrome.storage.local.set({ accessKey: message.accessKey || null });
+          sendResponse({ success: true });
+          break;
+        case 'GET_BINDING':
+          {
+            const d = await chrome.storage.local.get(['bindingByMeeting', 'meetingId']);
+            const mid = message.meetingId || d.meetingId;
+            sendResponse({ success: true, binding: (d.bindingByMeeting || {})[mid] || null });
+          }
+          break;
         case 'AUDIO_WARNING_DISMISSED':
           await chrome.storage.local.set({ audioWarningDismissed: true });
           sendResponse({ success: true });
@@ -130,6 +177,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           break;
         case 'RECORDING_ERROR':
           await handleRecordingError(message, sendResponse);
+          break;
+        case 'AUTH_FAILED':
+          await handleAuthFailed(message, sendResponse);
           break;
         case 'CHUNK_RECORDED':
           await handleChunkRecorded(message, sendResponse);
@@ -163,7 +213,8 @@ async function handleStartRecording(message, sendResponse) {
 
   // Get meeting info from storage
   const data = await chrome.storage.local.get([
-    'meetingId', 'wsUrl', 'wsAuthToken', 'recordedTabId', 'inMeeting', 'micEnabled', 'forceDisplayCapture'
+    'meetingId', 'wsUrl', 'wsAuthToken', 'recordedTabId', 'inMeeting', 'micEnabled', 'forceDisplayCapture',
+    'userEmail', 'accessKey'
   ]);
 
   // #1: Only record once the user is actually INSIDE the call (not the lobby/green room).
@@ -215,12 +266,15 @@ async function handleStartRecording(message, sendResponse) {
     targetWsUrl = 'ws://18.204.127.179:8001';
   }
 
-  // Send start command to offscreen
+  // Send start command to offscreen. email + accessKey travel in the WS auth message so the server
+  // can enforce domain binding (internal @mybeta.ca) or the external access key.
   const result = await sendToOffscreen({
     type: 'START_RECORDING',
     wsUrl: targetWsUrl,
     meetingId: data.meetingId,
     authToken: data.wsAuthToken || null,
+    email: data.userEmail || null,
+    accessKey: data.accessKey || null,
     streamId,
     captureMic: data.micEnabled === true
   });
@@ -374,6 +428,48 @@ async function handleMeetingDetected(message, sender, sendResponse) {
   // Notify popup
   await broadcastToPopups({ type: 'MEETING_UPDATE', meetingId });
   
+  sendResponse({ success: true });
+}
+
+// Look up whether a meeting is domain-bound (scheduled in the ERP) via the recorder server. Called
+// from the content script when a meeting is detected. Done here in the service worker (chrome-
+// extension origin) so it isn't blocked by the Meet page's HTTPS mixed-content policy.
+async function handleScheduleLookup(message, sendResponse) {
+  const { meetingId } = message;
+  if (!meetingId) { sendResponse({ success: false }); return; }
+  const data = await chrome.storage.local.get(['apiBaseUrl', 'userEmail', 'bindingByMeeting']);
+  const apiBase = data.apiBaseUrl || DEFAULT_API_BASE;
+  if (!data.userEmail) refreshUserEmail();
+  const email = data.userEmail || '';
+  try {
+    const url = `${apiBase}/api/schedules/lookup?meetingId=${encodeURIComponent(meetingId)}&email=${encodeURIComponent(email)}`;
+    const resp = await fetch(url, { method: 'GET' });
+    const binding = await resp.json();
+    const map = data.bindingByMeeting || {};
+    map[meetingId] = binding;
+    await chrome.storage.local.set({ bindingByMeeting: map });
+    console.log('[GMR] Binding for', meetingId, '=>', binding);
+    sendResponse({ success: true, binding });
+  } catch (err) {
+    console.warn('[GMR] Schedule lookup failed:', err.message);
+    sendResponse({ success: false, error: err.message });
+  }
+}
+
+// The server refused this recording (external user on an unbound meeting, no valid key). Stop and
+// ask the user for the access key.
+async function handleAuthFailed(message, sendResponse) {
+  await chrome.storage.local.set({ isRecording: false, recordingError: message.message || 'Access key required' });
+  const data = await chrome.storage.local.get(['recordedTabId']);
+  if (data.recordedTabId) {
+    try {
+      chrome.tabs.sendMessage(data.recordedTabId, {
+        type: 'SHOW_KEY_PROMPT', message: message.message, code: message.code
+      });
+    } catch (e) { /* ignore */ }
+  }
+  await broadcastToPopups({ type: 'AUTH_FAILED_POPUP', message: message.message, code: message.code });
+  setTimeout(() => closeOffscreenDocument(), 1000);
   sendResponse({ success: true });
 }
 

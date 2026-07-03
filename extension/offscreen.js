@@ -7,6 +7,8 @@ let ws = null;
 let meetingId = null;
 let wsUrl = null;
 let authToken = null;
+let userEmail = null;
+let accessKey = null;
 let recordingStartTime = null;
 let chunkSequence = 0;
 let reconnectTimer = null;
@@ -26,7 +28,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     try {
       switch (message.type) {
         case 'START_RECORDING':
-          await startRecording(message.wsUrl, message.meetingId, message.authToken, message.streamId, message.captureMic);
+          await startRecording(message.wsUrl, message.meetingId, message.authToken, message.streamId, message.captureMic, message.email, message.accessKey);
           sendResponse({ success: true });
           break;
         case 'STOP_RECORDING':
@@ -78,13 +80,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
 // Start recording. Prefers chrome.tabCapture (reliable tab audio = all participants); falls
 // back to getDisplayMedia if no stream id was provided.
-async function startRecording(serverUrl, mId, token, streamId, captureMic) {
+async function startRecording(serverUrl, mId, token, streamId, captureMic, email, key) {
   wsUrl = serverUrl;
   if (!wsUrl || typeof wsUrl !== 'string' || (!wsUrl.startsWith('ws://') && !wsUrl.startsWith('wss://'))) {
     wsUrl = 'ws://18.204.127.179:8001';
   }
   meetingId = mId;
   authToken = token || null;
+  userEmail = email || null;
+  accessKey = key || null;
 
   console.log('[GMR Offscreen] Starting recording for meeting:', meetingId, '| tabCapture:', !!streamId, '| mic:', !!captureMic);
 
@@ -456,12 +460,14 @@ function connectWebSocket() {
       ws.onopen = () => {
         console.log('[GMR Offscreen] WebSocket connected');
         
-        // Send auth message
+        // Send auth message. email + accessKey let the server enforce domain binding / external key.
         sendJSONMessage({
           type: 'auth',
           meetingId: meetingId,
           clientType: 'recorder',
-          token: authToken || undefined
+          token: authToken || undefined,
+          email: userEmail || undefined,
+          accessKey: accessKey || undefined
         });
         
         // Start heartbeat
@@ -580,6 +586,17 @@ function handleWebSocketMessage(data) {
         break;
       case 'status':
         console.log('[GMR Offscreen] Server status:', message);
+        // Server refused the recording (e.g. external user without a valid access key). Abort the
+        // local recording and surface a key prompt via the background worker.
+        if (message.ok === false) {
+          chrome.runtime.sendMessage({
+            type: 'AUTH_FAILED',
+            code: message.code || null,
+            message: message.message || 'Recording not authorized'
+          });
+          stopRecording();
+          closeWebSocket();
+        }
         break;
       default:
         // Forward to popup

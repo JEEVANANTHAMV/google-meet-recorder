@@ -453,6 +453,16 @@ function handleRuntimeMessage(message, sender, sendResponse) {
       stopTimer();
       renderRecordingCard();
       break;
+
+    case 'AUTH_FAILED_POPUP':
+      // External user / unbound meeting: the server refused recording. The in-page key prompt
+      // (content script) handles unlocking; here we just reflect the stopped state + message.
+      state.recordingError = message.message || 'Recording not authorized — access key required.';
+      state.isRecording = false;
+      state.isPaused = false;
+      stopTimer();
+      renderRecordingCard();
+      break;
     
     case 'WS_STATUS_UPDATE':
       state.wsConnected = message.connected;

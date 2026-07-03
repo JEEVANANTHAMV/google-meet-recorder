@@ -24,6 +24,14 @@
   let captionWarnCooldownUntil = 0;   // suppress duplicate "captions required" warnings
   let lastPanelOpenAttempt = 0;       // rate-limit auto-opening the People panel
 
+  // ===== Domain binding / scheduled-class awareness =====
+  // Populated from the recorder server via the background worker: whether this meeting is scheduled
+  // in the ERP (bound), whether the user is internal (@allowed-domain), and whether recording an
+  // unbound meeting requires the external access key.
+  let meetingBinding = null;          // { bound, internal, requiresKey, autoRecord, meeting:{...} }
+  let hasAccessKey = false;           // set once the user has entered the external key this session
+  let autoRecordAttempted = false;    // one-shot: don't spam auto-start attempts
+
   // ===== Participant tracking: stable-identity cache + snapshot-diff engine =====
   // id -> { id, name, joinedAt, lastSeen, leftAt, missingSince }
   const participantCache = new Map();
@@ -126,7 +134,10 @@
       type: 'MEETING_DETECTED',
       meetingId: meetingId
     });
-    
+
+    // Ask the recorder server whether this meeting is domain-bound / scheduled.
+    doScheduleLookup();
+
     // Setup UI Panel
     createPanelUI();
     loadAndListenToStorage();
@@ -150,6 +161,7 @@
       autoEnableCaptions();
       reconcileParticipants();
       checkMeetingEnded();
+      maybeAutoRecord();
       updateReminders();
     }, RECONCILE_INTERVAL_MS);
 
@@ -173,10 +185,13 @@
         const newMeetingId = extractMeetingId();
         if (newMeetingId && newMeetingId !== meetingId) {
           meetingId = newMeetingId;
+          meetingBinding = null;
+          autoRecordAttempted = false;
           chrome.runtime.sendMessage({
             type: 'MEETING_DETECTED',
             meetingId: meetingId
           });
+          doScheduleLookup();
         }
       }
     }).observe(document, { subtree: true, childList: true });
@@ -491,6 +506,13 @@
         showToast('You are not inside the meeting yet. Please join the meeting and then click Record.', 'warn');
         return;
       }
+
+      // External user on an unbound meeting: require the access key before recording.
+      if (meetingBinding && meetingBinding.requiresKey && !hasAccessKey) {
+        showKeyPrompt('This meeting is not bound to your organization. Enter the access key to record.');
+        return;
+      }
+
       autoEnableCaptions();
       chrome.runtime.sendMessage({ type: 'START_RECORDING' }, (resp) => {
         if (resp && resp.error === 'NOT_IN_MEETING') {
@@ -499,6 +521,120 @@
           showToast(resp.message || resp.error, 'error');
         }
       });
+    });
+  }
+
+  // Ask the background worker (chrome-extension origin, not subject to the Meet page's
+  // mixed-content policy) whether this meeting is domain-bound / scheduled.
+  function doScheduleLookup() {
+    try {
+      chrome.runtime.sendMessage({ type: 'SCHEDULE_LOOKUP', meetingId }, (resp) => {
+        if (chrome.runtime.lastError) return;
+        if (resp && resp.binding) {
+          meetingBinding = resp.binding;
+          console.log('[GMR Content] Meeting binding:', meetingBinding);
+          updateReminders();
+        }
+      });
+    } catch (e) { /* ignore */ }
+  }
+
+  // ==================== EXTERNAL ACCESS KEY PROMPT ====================
+  // Shown when an external user (email not in the allowed domain) tries to record a meeting that
+  // isn't registered in the ERP. On submit we persist the key and (re)start recording.
+  function showKeyPrompt(message) {
+    const existing = document.getElementById('gmr-key-overlay');
+    if (existing) existing.remove();
+
+    if (!document.getElementById('gmr-key-styles')) {
+      const st = document.createElement('style');
+      st.id = 'gmr-key-styles';
+      st.textContent = `
+        #gmr-key-overlay {
+          position: fixed; inset: 0; z-index: 1000002; display: flex; align-items: center; justify-content: center;
+          background: rgba(0,0,0,0.55); backdrop-filter: blur(4px);
+          font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        }
+        .gmr-key-card {
+          width: 380px; max-width: 90vw; background: rgba(28,28,30,0.98); color: #fff;
+          border: 1px solid rgba(255,255,255,0.12); border-radius: 16px; padding: 22px;
+          box-shadow: 0 20px 60px rgba(0,0,0,0.6);
+        }
+        .gmr-key-title { font-size: 16px; font-weight: 700; margin: 0 0 8px; }
+        .gmr-key-msg { font-size: 13px; color: #ccc; line-height: 1.45; margin: 0 0 14px; }
+        .gmr-key-input {
+          width: 100%; box-sizing: border-box; padding: 10px 12px; border-radius: 10px;
+          border: 1px solid rgba(255,255,255,0.2); background: rgba(255,255,255,0.06); color: #fff;
+          font-size: 14px; margin-bottom: 14px;
+        }
+        .gmr-key-actions { display: flex; gap: 8px; }
+        .gmr-key-btn { flex: 1; border: none; border-radius: 10px; padding: 10px; font-size: 13px; font-weight: 700; cursor: pointer; }
+        .gmr-key-btn.primary { background: #0a84ff; color: #fff; }
+        .gmr-key-btn.secondary { background: rgba(255,255,255,0.12); color: #fff; }
+        .gmr-key-err { color: #ff6b6b; font-size: 12px; margin: -8px 0 10px; min-height: 14px; }
+      `;
+      document.head.appendChild(st);
+    }
+
+    const input = createDOMElement('input', {
+      id: 'gmr-key-input', className: 'gmr-key-input', type: 'password',
+      placeholder: 'Access key', autocomplete: 'off'
+    });
+    const err = createDOMElement('div', { id: 'gmr-key-err', className: 'gmr-key-err' }, ['']);
+
+    const submit = () => {
+      const val = (input.value || '').trim();
+      if (!val) { err.textContent = 'Please enter the access key.'; return; }
+      hasAccessKey = true;
+      chrome.runtime.sendMessage({ type: 'SET_ACCESS_KEY', accessKey: val }, () => {
+        const overlay = document.getElementById('gmr-key-overlay');
+        if (overlay) overlay.remove();
+        // Start recording now — this click is the user gesture the capture APIs require.
+        autoEnableCaptions();
+        chrome.runtime.sendMessage({ type: 'START_RECORDING' }, (resp) => {
+          if (resp && resp.error) showToast(resp.message || resp.error, 'error');
+        });
+      });
+    };
+
+    input.addEventListener('keydown', (e) => { if (e.key === 'Enter') submit(); });
+
+    const card = createDOMElement('div', { className: 'gmr-key-card' }, [
+      createDOMElement('h3', { className: 'gmr-key-title' }, ['Access key required']),
+      createDOMElement('p', { className: 'gmr-key-msg' }, [message || 'Enter the access key to record this meeting.']),
+      input,
+      err,
+      createDOMElement('div', { className: 'gmr-key-actions' }, [
+        createDOMElement('button', { className: 'gmr-key-btn secondary', onClick: () => {
+          const overlay = document.getElementById('gmr-key-overlay');
+          if (overlay) overlay.remove();
+        } }, ['Cancel']),
+        createDOMElement('button', { className: 'gmr-key-btn primary', onClick: submit }, ['Unlock & Record'])
+      ])
+    ]);
+
+    const overlay = createDOMElement('div', { id: 'gmr-key-overlay' }, [card]);
+    document.body.appendChild(overlay);
+    setTimeout(() => input.focus(), 50);
+  }
+
+  // Best-effort auto-record for a scheduled (bound) class: once the user is inside the call, attempt
+  // to start recording. Capture APIs need a user gesture, so if the programmatic attempt is blocked
+  // the persistent scheduled-class reminder banner remains for the faculty to click.
+  function maybeAutoRecord() {
+    if (autoRecordAttempted) return;
+    if (!meetingBinding || !meetingBinding.bound || !meetingBinding.autoRecord) return;
+    if (meetingBinding.requiresKey) return;      // external users must enter the key manually
+    if (!isInCall() || gmrState.isRecording) return;
+    autoRecordAttempted = true;
+    autoEnableCaptions();
+    showToast('Scheduled class detected — starting recording. If the share prompt doesn\'t appear, click “Start Recording”.', 'info');
+    chrome.runtime.sendMessage({ type: 'START_RECORDING' }, (resp) => {
+      // If the browser blocked the automatic capture (no user gesture), the reminder banner nudges
+      // the faculty to click Start. We don't surface an error toast for that expected case.
+      if (resp && resp.error && resp.error !== 'NOT_IN_MEETING') {
+        console.log('[GMR Content] Auto-record needs a click:', resp.message || resp.error);
+      }
     });
   }
 
@@ -1028,15 +1164,21 @@
     const inCall = isInCall();
     const rec = !!gmrState.isRecording;
 
+    // Is this a scheduled (bound) class? If so, nag harder to start recording.
+    const scheduled = !!(meetingBinding && meetingBinding.bound);
+    const batchName = scheduled && meetingBinding.meeting ? meetingBinding.meeting.batchName : null;
+
     // Highest priority first.
     const candidates = [
       {
         id: 'start-recording',
         active: inCall && !rec,
-        message: 'You\'re in the meeting but recording hasn\'t started.',
+        message: scheduled
+          ? `This is a scheduled class${batchName ? ` (${batchName})` : ''}. Recording hasn\'t started — please start it so the session is captured.`
+          : 'You\'re in the meeting but recording hasn\'t started.',
         actionLabel: 'Start Recording',
         action: handleRecordButtonClick,
-        snoozeMs: 30000
+        snoozeMs: scheduled ? 15000 : 30000
       },
       {
         id: 'ws-disconnected',
@@ -1470,6 +1612,12 @@
         // Recording just started — re-emit the current roster so the server captures
         // everyone who was already in the call before the WebSocket existed.
         flushParticipantRoster();
+        sendResponse({ success: true });
+        break;
+      case 'SHOW_KEY_PROMPT':
+        // The server refused recording (external user / unbound meeting). Ask for the access key.
+        hasAccessKey = false;
+        showKeyPrompt(message.message || 'Enter the access key to record this meeting.');
         sendResponse({ success: true });
         break;
       default:
