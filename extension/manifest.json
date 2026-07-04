@@ -36,6 +36,17 @@
       "js": ["content.js"],
       "run_at": "document_idle",
       "all_frames": false
+    },
+    {
+      "matches": [
+        "https://erp.lmsmybeta.com/*",
+        "https://staging.lmsmybeta.com/*",
+        "http://localhost/*",
+        "http://127.0.0.1/*"
+      ],
+      "js": ["erp-detect.js"],
+      "run_at": "document_start",
+      "all_frames": false
     }
   ],
   "icons": {
