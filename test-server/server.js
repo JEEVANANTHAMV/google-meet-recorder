@@ -832,14 +832,17 @@ async function runMissedRecordingWatchdog() {
   try {
     const due = registry.dueForMissedEmail(CONFIG.missedGraceMinutes);
     for (const occ of due) {
+      /*
       const { subject, html } = missedRecordingEmail(occ, CONFIG.missedGraceMinutes);
       const cc = Array.from(new Set([...(occ.adminEmails || []), ...CONFIG.adminAlertEmails]))
         .filter(a => a && a !== occ.facultyEmail);
       const result = await mailer.send({ to: occ.facultyEmail, cc, subject, html });
-      // Mark emailed even if the mailer is disabled so we don't reprocess this occurrence every tick.
+      */
+      
+      // Mark emailed even if the mailer is disabled/commented out so we don't reprocess this occurrence every tick.
       registry.markMissedEmailed(occ);
-      logger.info({ meetingId: occ.meetingId, faculty: occ.facultyEmail, cc, sent: result.sent },
-        'Missed-recording alert processed');
+      logger.info({ meetingId: occ.meetingId, faculty: occ.facultyEmail },
+        'Missed-recording alert skipped (emails disabled)');
     }
   } catch (err) {
     logger.error({ err: err.message }, 'Missed-recording watchdog error');

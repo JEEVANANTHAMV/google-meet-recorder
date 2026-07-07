@@ -8,9 +8,10 @@ const nodemailer = require('nodemailer');
 const logger = require('./logger');
 
 function createMailer(config) {
-  const enabled = config.smtpEnabled && config.smtpHost && config.smtpUser && config.smtpPass;
+  const enabled = false; // config.smtpEnabled && config.smtpHost && config.smtpUser && config.smtpPass;
   let transport = null;
 
+  /*
   if (enabled) {
     transport = nodemailer.createTransport({
       host: config.smtpHost,
@@ -23,6 +24,8 @@ function createMailer(config) {
   } else {
     logger.warn('Mailer disabled — SMTP not fully configured; missed-recording emails will be logged only');
   }
+  */
+  logger.warn('Mailer disabled by default');
 
   return {
     enabled,
