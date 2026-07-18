@@ -463,6 +463,16 @@ function handleRuntimeMessage(message, sender, sendResponse) {
       stopTimer();
       renderRecordingCard();
       break;
+
+    case 'CAPTURE_INTERRUPTED_POPUP':
+      // Screen sharing was stopped mid-recording — the recording is broken. The in-page banner and
+      // a Chrome notification prompt the user to resume; here we just reflect the stopped state.
+      state.recordingError = 'Screen sharing was stopped — your recording is broken. Click "Continue recording" to resume.';
+      state.isRecording = false;
+      state.isPaused = false;
+      stopTimer();
+      renderRecordingCard();
+      break;
     
     case 'WS_STATUS_UPDATE':
       state.wsConnected = message.connected;

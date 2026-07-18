@@ -178,6 +178,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         case 'RECORDING_ERROR':
           await handleRecordingError(message, sendResponse);
           break;
+        case 'CAPTURE_INTERRUPTED':
+          await handleCaptureInterrupted(message, sendResponse);
+          break;
         case 'AUTH_FAILED':
           await handleAuthFailed(message, sendResponse);
           break;
@@ -286,8 +289,11 @@ async function handleStartRecording(message, sendResponse) {
       transcriptLines: [],
       activityLog: [],
       lastDownloadUrl: null,
-      lastFilename: null
+      lastFilename: null,
+      recordingInterrupted: false
     });
+    // Clear any lingering "recording interrupted" notification now that we're recording again.
+    try { chrome.notifications.clear(INTERRUPT_NOTIFICATION_ID); } catch (e) { /* ignore */ }
 
     // Ask the content script to re-emit the current roster so the server-side session
     // records everyone who was already in the call before the socket opened.
@@ -539,6 +545,108 @@ async function handleRecordingSaved(message, sendResponse) {
   await broadcastToPopups({ type: 'RECORDING_SAVED_POPUP', downloadUrl, filename, meetingId, sessionId });
   sendResponse({ success: true });
 }
+
+// The capture surface was pulled out from under an active recording — almost always the user
+// clicking Chrome's native "Stop sharing" bar (or closing the shared tab/window). The recording is
+// now broken, so raise a Chrome notification prompting the user to resume. Clicking the
+// notification (or its button) re-starts the recording via startRecordingAfterInterruption().
+const INTERRUPT_NOTIFICATION_ID = 'gmr-capture-interrupted';
+
+async function handleCaptureInterrupted(message, sendResponse) {
+  const stored = await chrome.storage.local.get(['recordedTabId']);
+
+  // If the Meet tab itself is gone, the "interruption" is just the tab closing — there's nothing to
+  // resume, and chrome.tabs.onRemoved already stops the recording. Don't nag the user in that case.
+  if (stored.recordedTabId != null) {
+    const tabStillOpen = await new Promise((resolve) => {
+      chrome.tabs.get(stored.recordedTabId, (tab) => resolve(!chrome.runtime.lastError && !!tab));
+    });
+    if (!tabStillOpen) {
+      console.log('[GMR] Capture interrupted but Meet tab is gone — treating as normal stop');
+      await chrome.storage.local.set({ isRecording: false, isPaused: false, recordingStartTime: null });
+      if (sendResponse) sendResponse({ success: true });
+      return;
+    }
+  }
+
+  console.warn('[GMR] Capture interrupted — recording broken, prompting user to resume');
+
+  await chrome.storage.local.set({
+    isRecording: false,
+    isPaused: false,
+    recordingStartTime: null,
+    recordingInterrupted: true
+  });
+
+  await broadcastToPopups({ type: 'CAPTURE_INTERRUPTED_POPUP', meetingId: message.meetingId });
+
+  // Chrome notification: needs "get permission" for notifications, which the browser grants the
+  // extension implicitly via the "notifications" permission. Clicking it resumes recording.
+  try {
+    chrome.notifications.create(INTERRUPT_NOTIFICATION_ID, {
+      type: 'basic',
+      iconUrl: 'icons/icon128.png',
+      title: 'Recording interrupted',
+      message: 'Screen sharing was stopped, so your recording is broken. Click to continue recording.',
+      priority: 2,
+      requireInteraction: true,
+      buttons: [{ title: 'Continue recording' }]
+    });
+  } catch (err) {
+    console.warn('[GMR] Failed to create interruption notification:', err);
+  }
+
+  // Also nudge the in-page banner in the Meet tab so the prompt is visible even without OS notifications.
+  if (stored.recordedTabId != null) {
+    try {
+      chrome.tabs.sendMessage(stored.recordedTabId, { type: 'SHOW_RESUME_PROMPT' });
+    } catch (e) { /* ignore */ }
+  }
+
+  if (sendResponse) sendResponse({ success: true });
+}
+
+// Resume a recording that was broken by "Stop sharing". Cleanly close any leftover offscreen doc
+// first, then start fresh. Forces the display-capture picker so the user re-selects a surface.
+async function startRecordingAfterInterruption() {
+  chrome.notifications.clear(INTERRUPT_NOTIFICATION_ID);
+  await chrome.storage.local.set({ recordingInterrupted: false });
+
+  const data = await chrome.storage.local.get(['recordedTabId']);
+  // Prefer a tabCapture stream id (no picker, clean tab audio); fall back to the display picker.
+  let streamId = null;
+  let targetTabId = data.recordedTabId;
+  if (targetTabId == null) {
+    try {
+      const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (tabs[0] && /meet\.google\.com/.test(tabs[0].url || '')) targetTabId = tabs[0].id;
+    } catch (e) { /* ignore */ }
+  }
+  if (targetTabId != null) {
+    try {
+      streamId = await new Promise((resolve, reject) => {
+        chrome.tabCapture.getMediaStreamId({ targetTabId }, (id) => {
+          if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+          else resolve(id);
+        });
+      });
+    } catch (err) {
+      console.warn('[GMR] Resume: tabCapture id failed, will use display picker:', err.message);
+    }
+  }
+
+  await handleStartRecording({ type: 'START_RECORDING', streamId }, (resp) => {
+    if (resp && resp.error) console.warn('[GMR] Resume recording failed:', resp.message || resp.error);
+  });
+}
+
+// Notification interactions (body click or the "Continue recording" button) resume recording.
+chrome.notifications.onClicked.addListener((notificationId) => {
+  if (notificationId === INTERRUPT_NOTIFICATION_ID) startRecordingAfterInterruption();
+});
+chrome.notifications.onButtonClicked.addListener((notificationId, buttonIndex) => {
+  if (notificationId === INTERRUPT_NOTIFICATION_ID && buttonIndex === 0) startRecordingAfterInterruption();
+});
 
 // Handle recording error from offscreen
 async function handleRecordingError(message, sendResponse) {

@@ -785,6 +785,11 @@
     }
 
     // Captions are OFF.
+    // Don't grab focus with the toggle click while the user is typing (e.g. in the chat box) — it
+    // would swallow their keystroke. Skip this tick; the periodic loop retries in ~2s once they're
+    // done typing. Captions being off briefly only delays transcript re-capture, nothing more.
+    if (isUserTyping()) return false;
+
     const now = Date.now();
     if (captionsArmed && now > captionWarnCooldownUntil) {
       // We had captions on and they're off now -> the user turned them off.
@@ -840,6 +845,22 @@
       reconcileDebounce = null;
       reconcileParticipants();
     }, 400);
+  }
+
+  // Is the user actively typing into a Meet input (chat composer, search box, any editable field)?
+  // Our periodic housekeeping clicks (auto-enabling captions, opening the People panel) move focus
+  // to a button, which yanks focus out of the chat box and drops the keystroke the user was typing.
+  // We suppress ONLY those focus-stealing clicks while typing — transcript capture (passive DOM
+  // observation) and participant reconcile logic are unaffected, so nothing else is impacted.
+  function isUserTyping() {
+    const el = document.activeElement;
+    if (!el) return false;
+    const tag = (el.tagName || '').toLowerCase();
+    if (tag === 'input' || tag === 'textarea') return true;
+    if (el.isContentEditable) return true;                 // Meet's chat composer is contenteditable
+    const role = (el.getAttribute && el.getAttribute('role')) || '';
+    if (role === 'textbox' || role === 'searchbox' || role === 'combobox') return true;
+    return false;
   }
 
   // Are we actually inside the call (not the green room / lobby / "you left" screen)?
@@ -912,6 +933,10 @@
   // we don't fight a user who deliberately closes it.
   function ensurePeoplePanelOpen() {
     if (findPeoplePanelContainer()) return;
+    // Opening the panel focuses its button, stealing focus from the chat box mid-keystroke. Skip
+    // while the user is typing; the reconcile loop retries shortly and falls back to reading names
+    // from video tiles in the meantime, so participant tracking is not affected.
+    if (isUserTyping()) return;
     const now = Date.now();
     if (now - lastPanelOpenAttempt < 30000) return;
     lastPanelOpenAttempt = now;
@@ -1150,6 +1175,78 @@
     const toast = createDOMElement('div', { id: 'gmr-toast', className: variant || '' }, [message]);
     document.body.appendChild(toast);
     setTimeout(() => { if (toast.parentNode) toast.remove(); }, 6000);
+  }
+
+  // ==================== RESUME-RECORDING PROMPT ====================
+  // Shown when the user stops screen sharing mid-recording (Chrome's native "Stop sharing").
+  // The recording is broken until they resume; this in-page banner (plus a Chrome notification
+  // raised by the background worker) lets them click to continue. This click is the user gesture
+  // the capture APIs need to re-acquire a stream.
+  function showResumePrompt() {
+    const existing = document.getElementById('gmr-resume-overlay');
+    if (existing) existing.remove();
+
+    if (!document.getElementById('gmr-resume-styles')) {
+      const st = document.createElement('style');
+      st.id = 'gmr-resume-styles';
+      st.textContent = `
+        #gmr-resume-overlay {
+          position: fixed; top: 14px; left: 50%; transform: translateX(-50%);
+          z-index: 1000003; display: flex; align-items: center; gap: 12px;
+          max-width: 600px; padding: 12px 14px 12px 18px;
+          background: rgba(40, 8, 8, 0.97); color: #fff;
+          border: 1px solid rgba(255, 59, 48, 0.6); border-radius: 12px;
+          box-shadow: 0 12px 40px rgba(0,0,0,0.6);
+          font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-size: 13px;
+          animation: gmr-resume-in 0.25s ease;
+        }
+        @keyframes gmr-resume-in { from { opacity: 0; transform: translate(-50%, -10px); } to { opacity: 1; transform: translate(-50%, 0); } }
+        .gmr-resume-icon { color: #ff453a; font-size: 16px; flex-shrink: 0; }
+        .gmr-resume-msg { flex: 1; line-height: 1.4; }
+        .gmr-resume-action {
+          background: #ff3b30; color: #fff; border: none; border-radius: 8px;
+          padding: 8px 14px; font-size: 12px; font-weight: 700; cursor: pointer; white-space: nowrap;
+        }
+        .gmr-resume-action:hover { background: #ff453a; }
+        .gmr-resume-dismiss {
+          background: rgba(255,255,255,0.1); border: none; color: #fff; width: 26px; height: 26px;
+          border-radius: 50%; cursor: pointer; font-size: 16px; line-height: 1; flex-shrink: 0;
+        }
+        .gmr-resume-dismiss:hover { background: rgba(255,255,255,0.2); }
+      `;
+      document.head.appendChild(st);
+    }
+
+    const resume = () => {
+      const overlay = document.getElementById('gmr-resume-overlay');
+      if (overlay) overlay.remove();
+      // This click is the user gesture the capture APIs require. Force the display picker so the
+      // user re-selects a surface to share.
+      chrome.storage.local.set({ forceDisplayCapture: true }, () => {
+        autoEnableCaptions();
+        chrome.runtime.sendMessage({ type: 'START_RECORDING' }, (resp) => {
+          if (resp && resp.error) showToast(resp.message || resp.error, 'error');
+        });
+      });
+    };
+
+    const banner = createDOMElement('div', { id: 'gmr-resume-overlay' }, [
+      createDOMElement('span', { className: 'gmr-resume-icon' }, ['⛔']),
+      createDOMElement('span', { className: 'gmr-resume-msg' }, [
+        'Screen sharing was stopped, so your recording is broken. Click to continue recording.'
+      ]),
+      createDOMElement('button', { className: 'gmr-resume-action', onClick: resume }, ['Continue recording']),
+      createDOMElement('button', {
+        className: 'gmr-resume-dismiss',
+        title: 'Dismiss',
+        onClick: () => {
+          const b = document.getElementById('gmr-resume-overlay');
+          if (b) b.remove();
+        }
+      }, ['×'])
+    ]);
+
+    document.body.appendChild(banner);
   }
 
   // ==================== PERSISTENT REMINDERS ====================
@@ -1618,6 +1715,11 @@
         // The server refused recording (external user / unbound meeting). Ask for the access key.
         hasAccessKey = false;
         showKeyPrompt(message.message || 'Enter the access key to record this meeting.');
+        sendResponse({ success: true });
+        break;
+      case 'SHOW_RESUME_PROMPT':
+        // Screen sharing was stopped mid-recording — surface an in-page prompt to resume.
+        showResumePrompt();
         sendResponse({ success: true });
         break;
       default:

@@ -11,6 +11,7 @@ let userEmail = null;
 let accessKey = null;
 let recordingStartTime = null;
 let chunkSequence = 0;
+let stoppingIntentionally = false; // true when stop is user/meeting-initiated (not "Stop sharing")
 let reconnectTimer = null;
 let heartbeatTimer = null;
 let pingTime = 0;
@@ -89,6 +90,7 @@ async function startRecording(serverUrl, mId, token, streamId, captureMic, email
   authToken = token || null;
   userEmail = email || null;
   accessKey = key || null;
+  stoppingIntentionally = false; // fresh recording: any capture-end is now an interruption
 
   console.log('[GMR Offscreen] Starting recording for meeting:', meetingId, '| tabCapture:', !!streamId, '| mic:', !!captureMic);
 
@@ -150,9 +152,21 @@ async function startRecording(serverUrl, mId, token, streamId, captureMic, email
       monitorAudioVolume(audioTracks[0]);
     }
 
-    // Handle capture end (tab closed / "Stop sharing")
+    // Handle capture end. If the user clicks Chrome's native "Stop sharing" button (screen/tab
+    // share) or the shared surface goes away, the video track ends WHILE we still think we're
+    // recording. That silently breaks the recording, so instead of quietly stopping we flag it as
+    // an interruption: the background worker raises a Chrome notification prompting the user to
+    // resume. A deliberate stop (meeting end / Stop button) sets `stoppingIntentionally` first, so
+    // this only fires for the unexpected "Stop sharing" case.
     const vTrack = captureStream.getVideoTracks()[0];
-    if (vTrack) vTrack.onended = () => { console.log('[GMR Offscreen] Capture ended'); stopRecording(); };
+    if (vTrack) vTrack.onended = () => {
+      console.log('[GMR Offscreen] Capture ended (track onended)');
+      if (stoppingIntentionally) {
+        stopRecording();
+      } else {
+        handleCaptureInterrupted();
+      }
+    };
 
     // Create MediaRecorder
     const mimeType = getSupportedMimeType();
@@ -268,10 +282,22 @@ async function buildRecordingStream(capture, mic, isTabCapture) {
   }
 }
 
+// The shared surface went away unexpectedly (user clicked Chrome's "Stop sharing", or the shared
+// tab/window closed) while we still believed we were recording. Tear the local capture down but
+// ask the background worker to raise a notification so the user can resume — the recording is
+// otherwise silently broken. Transcript/participant capture (DOM-based, in the content script) is
+// untouched by this and keeps working.
+function handleCaptureInterrupted() {
+  console.warn('[GMR Offscreen] Capture interrupted (Stop sharing / surface closed)');
+  chrome.runtime.sendMessage({ type: 'CAPTURE_INTERRUPTED', meetingId });
+  stopRecording();
+}
+
 // Stop recording
 async function stopRecording() {
   console.log('[GMR Offscreen] Stopping recording...');
 
+  stoppingIntentionally = true; // any track-end from here on is part of an intentional stop
   stopDurationReporting();
 
   if (mediaRecorder && mediaRecorder.state !== 'inactive') {
