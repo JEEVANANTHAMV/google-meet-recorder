@@ -137,8 +137,9 @@ function createLocalBackend(config) {
       logger.info({ root }, 'Local storage backend ready');
     },
 
-    createRecordingWriteStream(meetingId, sessionId) {
-      return fs.createWriteStream(fullPath(meetingId, sessionId, 'recording.webm'));
+    createRecordingWriteStream(meetingId, sessionId, options = {}) {
+      const flags = options && options.append ? 'a' : 'w';
+      return fs.createWriteStream(fullPath(meetingId, sessionId, 'recording.webm'), { flags });
     },
 
     async writeJSON(meetingId, sessionId, name, obj) {

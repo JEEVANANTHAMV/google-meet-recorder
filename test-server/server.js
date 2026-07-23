@@ -41,6 +41,7 @@ const CONFIG = {
   authToken: process.env.AUTH_TOKEN || '',
   heartbeatIntervalMs: parseInt(process.env.WS_HEARTBEAT_MS || '15000', 10),
   flushIntervalMs: parseInt(process.env.EVENT_FLUSH_MS || '5000', 10),
+  disconnectGraceMs: parseInt(process.env.DISCONNECT_GRACE_MS || '15000', 10),
   corsOrigin: process.env.CORS_ORIGIN || '*',
 
   // ---- Domain binding / access control ----
@@ -196,6 +197,7 @@ async function finalizeSession(session, reason) {
   if (session.finalized) return;
   session.finalized = true;
   if (session.flushTimer) { clearTimeout(session.flushTimer); session.flushTimer = null; }
+  if (session.disconnectTimer) { clearTimeout(session.disconnectTimer); session.disconnectTimer = null; }
 
   await endRecordingStream(session);
 
@@ -286,8 +288,37 @@ function handleAuth(message, ws, remoteAddress) {
   const meetingId = safeSegment(message.meetingId || 'unknown');
   const clientType = message.clientType || 'recorder';
 
-  // Domain-binding / external-key gate (recorders only).
+  // Domain-binding / session takeover (recorders only).
   if (clientType === 'recorder') {
+    // Session takeover & seamless reconnection:
+    // If a session for this meeting already exists, re-attach to the ongoing session.
+    if (recordingByMeeting.has(meetingId)) {
+      const existingId = recordingByMeeting.get(meetingId);
+      const existing = sessions.get(existingId);
+      if (existing && !existing.finalized) {
+        if (existing.disconnectTimer) {
+          clearTimeout(existing.disconnectTimer);
+          existing.disconnectTimer = null;
+        }
+        if (existing.ws && existing.ws !== ws) {
+          sessionByWs.delete(existing.ws);
+          try { existing.ws.terminate(); } catch (e) { /* ignore */ }
+        }
+        existing.ws = ws;
+        existing.remoteAddress = remoteAddress;
+        existing.state = 'recording';
+        sessionByWs.set(ws, existing);
+
+        logger.info({ sessionId: existing.id, meetingId, clientType, remoteAddress }, 'Session re-attached / resumed for single-file meeting recording');
+
+        ws.send(JSON.stringify({
+          type: 'status', ok: true, message: 'Authenticated', sessionId: existing.id, meetingId, reconnected: true
+        }));
+        return;
+      }
+    }
+
+    // New session: enforce domain-binding / external-key gate.
     const auth = authorizeRecorder(message, meetingId);
     if (!auth.allowed) {
       logger.warn({ remoteAddress, meetingId, email: message.email }, 'Auth rejected: external key required');
@@ -300,15 +331,28 @@ function handleAuth(message, ws, remoteAddress) {
     }
     message._authReason = auth.reason;
   }
-
-  // Connection limit: refuse a second concurrent recorder for the same meeting (prevents
-  // duplicate uploads). A reconnect after the old socket closed is fine — that session is gone.
   if (clientType === 'recorder' && recordingByMeeting.has(meetingId)) {
-    const existing = sessions.get(recordingByMeeting.get(meetingId));
-    if (existing && existing.ws && existing.ws.readyState === WebSocket.OPEN && existing.ws !== ws) {
-      logger.warn({ meetingId }, 'Auth rejected: meeting already being recorded');
-      ws.send(JSON.stringify({ type: 'status', ok: false, message: 'Meeting already being recorded' }));
-      ws.close(4002, 'Duplicate recorder');
+    const existingId = recordingByMeeting.get(meetingId);
+    const existing = sessions.get(existingId);
+    if (existing && !existing.finalized) {
+      if (existing.disconnectTimer) {
+        clearTimeout(existing.disconnectTimer);
+        existing.disconnectTimer = null;
+      }
+      if (existing.ws && existing.ws !== ws) {
+        sessionByWs.delete(existing.ws);
+        try { existing.ws.terminate(); } catch (e) { /* ignore */ }
+      }
+      existing.ws = ws;
+      existing.remoteAddress = remoteAddress;
+      existing.state = 'recording';
+      sessionByWs.set(ws, existing);
+
+      logger.info({ sessionId: existing.id, meetingId, clientType, remoteAddress }, 'Session re-attached / resumed for single-file meeting recording');
+
+      ws.send(JSON.stringify({
+        type: 'status', ok: true, message: 'Authenticated', sessionId: existing.id, meetingId, reconnected: true
+      }));
       return;
     }
   }
@@ -353,13 +397,14 @@ function handleAuth(message, ws, remoteAddress) {
 function handleRecordingChunk(session, sequence, timestamp, data) {
   if (!session) return;
   if (!session.recordingStream) {
-    session.recordingStream = storage.createRecordingWriteStream(session.meetingId, session.id);
+    const isAppend = session.bytes > 0;
+    session.recordingStream = storage.createRecordingWriteStream(session.meetingId, session.id, { append: isAppend });
     session.recordingStream.on('error', (err) => {
       session.recordingError = err.message;
       logger.error({ err: err.message, sessionId: session.id }, 'Recording upload stream error');
     });
-    logger.info({ sessionId: session.id, object: objectPath(session.meetingId, session.id, 'recording.webm') },
-      'Recording upload started');
+    logger.info({ sessionId: session.id, object: objectPath(session.meetingId, session.id, 'recording.webm'), isAppend },
+      'Recording upload stream started/resumed');
   }
   session.recordingStream.write(data);
   session.chunkCount = sequence;
@@ -802,7 +847,17 @@ wss.on('connection', (ws, req) => {
   ws.on('close', () => {
     const session = sessionByWs.get(ws);
     logger.info({ remoteAddress, sessionId: session && session.id }, 'WS client disconnected');
-    if (session) finalizeSession(session, 'socket_close');
+    if (session) {
+      sessionByWs.delete(ws);
+      session.ws = null;
+      if (session.disconnectTimer) clearTimeout(session.disconnectTimer);
+      // Wait for a disconnect grace period before finalizing so brief network flickers can reconnect.
+      session.disconnectTimer = setTimeout(() => {
+        session.disconnectTimer = null;
+        logger.info({ sessionId: session.id }, 'Disconnect grace period expired, finalizing session');
+        finalizeSession(session, 'socket_close');
+      }, CONFIG.disconnectGraceMs);
+    }
   });
 
   ws.on('error', (err) => logger.error({ err: err.message }, 'WS error'));

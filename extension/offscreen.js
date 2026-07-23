@@ -20,6 +20,8 @@ let stream = null;          // the stream handed to MediaRecorder (tab video + m
 let captureStream = null;   // raw tab/display capture stream
 let micStream = null;       // local microphone (best-effort, for the local speaker's voice)
 let playbackContext = null; // AudioContext that mixes audio + replays meeting audio to the user
+let currentSessionId = null; // Backend active session ID for reconnection
+let chunkQueue = [];        // Buffer chunks during temporary socket drop
 
 // Message handler from background script
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -322,6 +324,8 @@ async function stopRecording() {
   // after receiving the 'recording_saved' confirmation from the server.
 
   recordingStartTime = null;
+  currentSessionId = null;
+  chunkQueue = [];
 
   chrome.runtime.sendMessage({
     type: 'RECORDING_STATUS',
@@ -357,16 +361,26 @@ function resumeRecording() {
 // Handle recording chunk
 function handleChunk(blob) {
   chunkSequence++;
+  const seq = chunkSequence;
   
-  // Send via WebSocket
+  // Send via WebSocket if open, or queue during brief disconnect
   if (ws && ws.readyState === WebSocket.OPEN) {
-    sendChunkOverWebSocket(blob, chunkSequence);
+    while (chunkQueue.length > 0) {
+      const item = chunkQueue.shift();
+      sendChunkOverWebSocket(item.blob, item.seq);
+    }
+    sendChunkOverWebSocket(blob, seq);
+  } else {
+    // Buffer up to 60 chunks (~60 seconds of video) during reconnection
+    if (chunkQueue.length < 60) {
+      chunkQueue.push({ blob, seq });
+    }
   }
   
   // Also notify background about chunk
   chrome.runtime.sendMessage({
     type: 'CHUNK_RECORDED',
-    sequence: chunkSequence,
+    sequence: seq,
     size: blob.size
   });
 }
@@ -486,10 +500,11 @@ function connectWebSocket() {
       ws.onopen = () => {
         console.log('[GMR Offscreen] WebSocket connected');
         
-        // Send auth message. email + accessKey let the server enforce domain binding / external key.
+        // Send auth message including currentSessionId, userEmail, accessKey
         sendJSONMessage({
           type: 'auth',
           meetingId: meetingId,
+          sessionId: currentSessionId || undefined,
           clientType: 'recorder',
           token: authToken || undefined,
           email: userEmail || undefined,
@@ -612,9 +627,9 @@ function handleWebSocketMessage(data) {
         break;
       case 'status':
         console.log('[GMR Offscreen] Server status:', message);
-        // Server refused the recording (e.g. external user without a valid access key). Abort the
-        // local recording and surface a key prompt via the background worker.
         if (message.ok === false) {
+          // Server refused the recording (e.g. external user without a valid access key). Abort the
+          // local recording and surface a key prompt via the background worker.
           chrome.runtime.sendMessage({
             type: 'AUTH_FAILED',
             code: message.code || null,
@@ -622,6 +637,13 @@ function handleWebSocketMessage(data) {
           });
           stopRecording();
           closeWebSocket();
+        } else if (message.ok && message.sessionId) {
+          currentSessionId = message.sessionId;
+          // Flush any buffered chunks after successful reconnection
+          while (chunkQueue.length > 0 && ws && ws.readyState === WebSocket.OPEN) {
+            const item = chunkQueue.shift();
+            sendChunkOverWebSocket(item.blob, item.seq);
+          }
         }
         break;
       default:
