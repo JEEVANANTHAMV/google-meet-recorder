@@ -56,6 +56,9 @@ const CONFIG = {
   backendWebhookSecret: process.env.BACKEND_WEBHOOK_SECRET || '',
 
   // ---- Missed-recording watchdog ----
+  // Master switch for the missed-recording alert email. Set MISSED_RECORDING_EMAILS_ENABLED=false
+  // to stop sending (the watchdog still marks occurrences so it doesn't reprocess them each tick).
+  missedEmailsEnabled: process.env.MISSED_RECORDING_EMAILS_ENABLED !== 'false',
   missedGraceMinutes: parseInt(process.env.MISSED_RECORDING_GRACE_MIN || '10', 10),
   watchdogIntervalMs: parseInt(process.env.WATCHDOG_INTERVAL_MS || '60000', 10),
   adminAlertEmails: (process.env.ADMIN_ALERT_EMAILS || '').split(',').map(s => s.trim()).filter(Boolean),
@@ -877,17 +880,20 @@ async function runMissedRecordingWatchdog() {
   try {
     const due = registry.dueForMissedEmail(CONFIG.missedGraceMinutes);
     for (const occ of due) {
-      /*
-      const { subject, html } = missedRecordingEmail(occ, CONFIG.missedGraceMinutes);
-      const cc = Array.from(new Set([...(occ.adminEmails || []), ...CONFIG.adminAlertEmails]))
-        .filter(a => a && a !== occ.facultyEmail);
-      const result = await mailer.send({ to: occ.facultyEmail, cc, subject, html });
-      */
-      
-      // Mark emailed even if the mailer is disabled/commented out so we don't reprocess this occurrence every tick.
+      if (CONFIG.missedEmailsEnabled) {
+        const { subject, html } = missedRecordingEmail(occ, CONFIG.missedGraceMinutes);
+        const cc = Array.from(new Set([...(occ.adminEmails || []), ...CONFIG.adminAlertEmails]))
+          .filter(a => a && a !== occ.facultyEmail);
+        const result = await mailer.send({ to: occ.facultyEmail, cc, subject, html });
+        logger.info({ meetingId: occ.meetingId, faculty: occ.facultyEmail, cc, sent: result.sent, reason: result.reason },
+          result.sent ? 'Missed-recording alert emailed' : 'Missed-recording alert not sent');
+      } else {
+        logger.info({ meetingId: occ.meetingId, faculty: occ.facultyEmail },
+          'Missed-recording alert skipped (MISSED_RECORDING_EMAILS_ENABLED=false)');
+      }
+
+      // Mark emailed regardless of send outcome/toggle so we don't reprocess this occurrence every tick.
       registry.markMissedEmailed(occ);
-      logger.info({ meetingId: occ.meetingId, faculty: occ.facultyEmail },
-        'Missed-recording alert skipped (emails disabled)');
     }
   } catch (err) {
     logger.error({ err: err.message }, 'Missed-recording watchdog error');
