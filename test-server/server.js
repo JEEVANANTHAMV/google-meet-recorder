@@ -301,8 +301,9 @@ function handleAuth(message, ws, remoteAddress) {
           existing.disconnectTimer = null;
         }
         if (existing.ws && existing.ws !== ws) {
-          sessionByWs.delete(existing.ws);
-          try { existing.ws.terminate(); } catch (e) { /* ignore */ }
+          const oldWs = existing.ws;
+          sessionByWs.delete(oldWs);
+          try { oldWs.close(4000, 'Replaced by new connection'); } catch (e) { /* ignore */ }
         }
         existing.ws = ws;
         existing.remoteAddress = remoteAddress;
@@ -330,31 +331,6 @@ function handleAuth(message, ws, remoteAddress) {
       return;
     }
     message._authReason = auth.reason;
-  }
-  if (clientType === 'recorder' && recordingByMeeting.has(meetingId)) {
-    const existingId = recordingByMeeting.get(meetingId);
-    const existing = sessions.get(existingId);
-    if (existing && !existing.finalized) {
-      if (existing.disconnectTimer) {
-        clearTimeout(existing.disconnectTimer);
-        existing.disconnectTimer = null;
-      }
-      if (existing.ws && existing.ws !== ws) {
-        sessionByWs.delete(existing.ws);
-        try { existing.ws.terminate(); } catch (e) { /* ignore */ }
-      }
-      existing.ws = ws;
-      existing.remoteAddress = remoteAddress;
-      existing.state = 'recording';
-      sessionByWs.set(ws, existing);
-
-      logger.info({ sessionId: existing.id, meetingId, clientType, remoteAddress }, 'Session re-attached / resumed for single-file meeting recording');
-
-      ws.send(JSON.stringify({
-        type: 'status', ok: true, message: 'Authenticated', sessionId: existing.id, meetingId, reconnected: true
-      }));
-      return;
-    }
   }
 
   const session = {
@@ -406,7 +382,15 @@ function handleRecordingChunk(session, sequence, timestamp, data) {
     logger.info({ sessionId: session.id, object: objectPath(session.meetingId, session.id, 'recording.webm'), isAppend },
       'Recording upload stream started/resumed');
   }
-  session.recordingStream.write(data);
+  const writeOk = session.recordingStream.write(data);
+  if (!writeOk && session.ws && typeof session.ws.pause === 'function') {
+    session.ws.pause();
+    session.recordingStream.once('drain', () => {
+      if (session.ws && typeof session.ws.resume === 'function') {
+        session.ws.resume();
+      }
+    });
+  }
   session.chunkCount = sequence;
   session.bytes += data.length;
   if (sequence % 30 === 0) {
@@ -863,12 +847,18 @@ wss.on('connection', (ws, req) => {
   ws.on('error', (err) => logger.error({ err: err.message }, 'WS error'));
 });
 
-// Heartbeat: terminate sockets that miss a pong (no more zombie connections).
+// Heartbeat: terminate sockets that miss 2 consecutive pongs (tolerant to transient network/event-loop spikes).
 const heartbeat = setInterval(() => {
   wss.clients.forEach(ws => {
+    if (ws.missedPings === undefined) ws.missedPings = 0;
     if (ws.isAlive === false) {
-      logger.warn('Terminating unresponsive WS client (missed pong)');
-      return ws.terminate();
+      ws.missedPings++;
+      if (ws.missedPings >= 2) {
+        logger.warn('Terminating unresponsive WS client (missed 2 consecutive pongs)');
+        return ws.terminate();
+      }
+    } else {
+      ws.missedPings = 0;
     }
     ws.isAlive = false;
     try { ws.ping(); } catch (e) { /* ignore */ }

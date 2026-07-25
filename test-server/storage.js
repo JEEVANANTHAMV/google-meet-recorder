@@ -180,25 +180,37 @@ function createLocalBackend(config) {
     },
 
     async listSessions() {
-      const out = [];
       const base = path.join(root, ROOT_PREFIX);
-      if (!fs.existsSync(base)) return out;
+      try {
+        await fs.promises.access(base);
+      } catch (e) {
+        return [];
+      }
       const files = [];
-      const walk = (dir) => {
-        for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const walk = async (dir) => {
+        let entries = [];
+        try {
+          entries = await fs.promises.readdir(dir, { withFileTypes: true });
+        } catch (e) {
+          return;
+        }
+        for (const entry of entries) {
           const fp = path.join(dir, entry.name);
-          if (entry.isDirectory()) walk(fp);
-          else {
-            const st = fs.statSync(fp);
-            files.push({
-              name: path.relative(root, fp).split(path.sep).join('/'),
-              size: st.size,
-              updated: st.mtime.toISOString()
-            });
+          if (entry.isDirectory()) {
+            await walk(fp);
+          } else {
+            try {
+              const st = await fs.promises.stat(fp);
+              files.push({
+                name: path.relative(root, fp).split(path.sep).join('/'),
+                size: st.size,
+                updated: st.mtime.toISOString()
+              });
+            } catch (e) {}
           }
         }
       };
-      walk(base);
+      await walk(base);
       return groupSessions(files);
     }
   };
