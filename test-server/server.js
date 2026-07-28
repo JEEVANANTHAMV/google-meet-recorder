@@ -60,6 +60,13 @@ const CONFIG = {
   // to stop sending (the watchdog still marks occurrences so it doesn't reprocess them each tick).
   missedEmailsEnabled: process.env.MISSED_RECORDING_EMAILS_ENABLED !== 'false',
   missedGraceMinutes: parseInt(process.env.MISSED_RECORDING_GRACE_MIN || '10', 10),
+  // Only alert within this many minutes AFTER a class start. Prevents next-day false alarms for
+  // classes whose end + 24h window used to keep them "due" long after they were over. Default 120min.
+  missedWindowMinutes: parseInt(process.env.MISSED_RECORDING_WINDOW_MIN || '120', 10),
+  // Cutover floor: never alert for occurrences that started before this ISO timestamp. Pre-cutover
+  // classes were recorded by the old notetaker (not the extension), so the recorder's registry never
+  // marked them recorded — without this they generate false "you didn't record" emails. Empty = no floor.
+  missedCutoverIso: process.env.MISSED_RECORDING_CUTOVER_ISO || '',
   watchdogIntervalMs: parseInt(process.env.WATCHDOG_INTERVAL_MS || '60000', 10),
   adminAlertEmails: (process.env.ADMIN_ALERT_EMAILS || '').split(',').map(s => s.trim()).filter(Boolean),
 
@@ -878,7 +885,7 @@ let watchdogTimer = null;
 
 async function runMissedRecordingWatchdog() {
   try {
-    const due = registry.dueForMissedEmail(CONFIG.missedGraceMinutes);
+    const due = registry.dueForMissedEmail(CONFIG.missedGraceMinutes, CONFIG.missedWindowMinutes, CONFIG.missedCutoverIso);
     for (const occ of due) {
       if (CONFIG.missedEmailsEnabled) {
         const { subject, html } = missedRecordingEmail(occ, CONFIG.missedGraceMinutes);

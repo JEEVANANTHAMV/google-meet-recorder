@@ -205,20 +205,26 @@ function createScheduleRegistry(storage, config, logger) {
     },
 
     // Occurrences that started more than `graceMinutes` ago, are not yet recorded, and haven't been
-    // emailed about — the watchdog emails these once.
-    dueForMissedEmail(graceMinutes) {
+    // emailed about — the watchdog emails these once. `windowMinutes` bounds how long AFTER start we
+    // still alert (prevents next-day false alarms); `cutoverIso` (optional) skips occurrences that
+    // started before the extension cutover (those were recorded by the old notetaker, so the recorder
+    // registry never marked them recorded and they would otherwise all false-fire).
+    dueForMissedEmail(graceMinutes, windowMinutes, cutoverIso) {
       const now = Date.now();
       const graceMs = graceMinutes * 60 * 1000;
+      const windowMs = (Number.isFinite(windowMinutes) ? windowMinutes : 120) * 60 * 1000;
+      const cutoverMs = cutoverIso ? toEpoch(cutoverIso) : NaN;
       const due = [];
       for (const o of registry.values()) {
         if (o.recordedSessionId || o.missedEmailSentAt) continue;
         if (!o.facultyEmail) continue;
         const s = toEpoch(o.startAt);
         if (Number.isNaN(s)) continue;
-        const e = toEpoch(o.endAt);
-        // Overdue: past start + grace. Cap: don't email for very stale classes (>1 day past end).
-        const staleCutoff = (Number.isNaN(e) ? s + 6 * 3600 * 1000 : e) + 24 * 3600 * 1000;
-        if (now >= s + graceMs && now <= staleCutoff) due.push(o);
+        // Cutover floor: ignore anything that started before the extension went live.
+        if (!Number.isNaN(cutoverMs) && s < cutoverMs) continue;
+        // Alert only inside [start + grace, start + window]. A short window means a class that is
+        // long over (e.g. yesterday's) is never treated as "still missing".
+        if (now >= s + graceMs && now <= s + windowMs) due.push(o);
       }
       return due;
     },
