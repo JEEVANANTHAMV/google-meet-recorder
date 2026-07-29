@@ -885,7 +885,10 @@ let watchdogTimer = null;
 
 async function runMissedRecordingWatchdog() {
   try {
-    const due = registry.dueForMissedEmail(CONFIG.missedGraceMinutes, CONFIG.missedWindowMinutes, CONFIG.missedCutoverIso);
+    // Meetings with a recording open right now — the finished session only pushes at class end, so
+    // treat an in-progress recording as "not missed" (avoids alerting during a long class).
+    const activeMeetingIds = new Set(recordingByMeeting.keys());
+    const due = registry.dueForMissedEmail(CONFIG.missedGraceMinutes, CONFIG.missedWindowMinutes, CONFIG.missedCutoverIso, activeMeetingIds);
     for (const occ of due) {
       if (CONFIG.missedEmailsEnabled) {
         const { subject, html } = missedRecordingEmail(occ, CONFIG.missedGraceMinutes);

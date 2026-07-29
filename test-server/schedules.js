@@ -183,25 +183,32 @@ function createScheduleRegistry(storage, config, logger) {
     },
 
     // Link a finished recording session to the occurrence on the same date (so the watchdog knows the
-    // class WAS recorded, and so backend notifications can carry the splitScheduleId).
+    // class WAS recorded, and so backend notifications can carry the splitScheduleId). The same class
+    // can appear under more than one registry key (e.g. a legacy meet:code@date entry AND a split:id
+    // entry after the ERP started sending splitScheduleId) — mark EVERY same-day match for this meeting
+    // so a duplicate can't keep looking "missed" and double-email. Returns the best (closest) match so
+    // callers still get a single occurrence for the backend push (its splitScheduleId, if any).
     markRecorded(meetingId, sessionId, startedAtIso) {
       const mid = String(meetingId);
       const startMs = toEpoch(startedAtIso) || Date.now();
       let best = null, bestDist = Infinity;
+      const nowIso = new Date().toISOString();
+      let marked = 0;
       for (const o of registry.values()) {
         if (o.meetingId !== mid) continue;
         const s = toEpoch(o.startAt);
         const dist = Number.isNaN(s) ? Infinity : Math.abs(s - startMs);
-        if (dist < bestDist) { bestDist = dist; best = o; }
+        if (dist > 12 * 3600 * 1000) continue;   // same-day-ish only (~12h window)
+        // Mark this occurrence recorded (covers duplicate keys for the same class/date).
+        if (!o.recordedSessionId) { o.recordedSessionId = sessionId; o.recordedAt = nowIso; marked++; }
+        // Pick the closest match; on a tie prefer the one carrying a splitScheduleId so the backend
+        // push gets the precise class link rather than a legacy meet-code-only duplicate.
+        const better = dist < bestDist
+          || (dist === bestDist && o.splitScheduleId != null && (best == null || best.splitScheduleId == null));
+        if (better) { bestDist = dist; best = o; }
       }
-      // Only bind if the session started within a reasonable window of the occurrence (~12h).
-      if (best && bestDist <= 12 * 3600 * 1000) {
-        best.recordedSessionId = sessionId;
-        best.recordedAt = new Date().toISOString();
-        scheduleSave();
-        return best;
-      }
-      return null;
+      if (marked) scheduleSave();
+      return best;
     },
 
     // Occurrences that started more than `graceMinutes` ago, are not yet recorded, and haven't been
@@ -209,15 +216,23 @@ function createScheduleRegistry(storage, config, logger) {
     // still alert (prevents next-day false alarms); `cutoverIso` (optional) skips occurrences that
     // started before the extension cutover (those were recorded by the old notetaker, so the recorder
     // registry never marked them recorded and they would otherwise all false-fire).
-    dueForMissedEmail(graceMinutes, windowMinutes, cutoverIso) {
+    // `activeMeetingIds` (optional Set) = meetings with a recording currently IN PROGRESS. A recorder
+    // only pushes the finished session when the class ENDS, so a long class has no "recorded" flag yet
+    // at start+grace — without this it would false-alarm every time. Skipping meetings that are live
+    // right now prevents that. `windowMinutes` bounds how long after start we still alert; `cutoverIso`
+    // skips pre-extension-cutover classes (recorded by the old notetaker, never marked here).
+    dueForMissedEmail(graceMinutes, windowMinutes, cutoverIso, activeMeetingIds) {
       const now = Date.now();
       const graceMs = graceMinutes * 60 * 1000;
       const windowMs = (Number.isFinite(windowMinutes) ? windowMinutes : 120) * 60 * 1000;
       const cutoverMs = cutoverIso ? toEpoch(cutoverIso) : NaN;
+      const active = activeMeetingIds instanceof Set ? activeMeetingIds : new Set();
       const due = [];
       for (const o of registry.values()) {
         if (o.recordedSessionId || o.missedEmailSentAt) continue;
         if (!o.facultyEmail) continue;
+        // A recording is in progress for this meeting right now — not missed, just not finished yet.
+        if (active.has(String(o.meetingId))) continue;
         const s = toEpoch(o.startAt);
         if (Number.isNaN(s)) continue;
         // Cutover floor: ignore anything that started before the extension went live.
