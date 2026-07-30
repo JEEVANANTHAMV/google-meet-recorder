@@ -109,13 +109,32 @@ function createScheduleRegistry(storage, config, logger) {
         const n = normalize(raw);
         if (!n) continue;
         const key = occKey(n);
-        const prev = registry.get(key);
+        let prev = registry.get(key);
+
+        // De-dupe legacy key: when this occurrence now has a splitScheduleId (key = split:<id>),
+        // an older registration of the SAME class+date may still exist under the legacy meet:<code>@<date>
+        // key. Left in place it becomes a second "occurrence" that double-emails / double-counts. Remove
+        // it, carrying its watchdog state forward so we don't re-alert or lose a recorded flag.
+        if (n.splitScheduleId != null && key.startsWith('split:')) {
+          const legacyKey = `meet:${n.meetingId}@${(n.startAt || '').slice(0, 10)}`;
+          const legacy = registry.get(legacyKey);
+          if (legacy) {
+            if (!prev) prev = legacy;           // inherit state from the legacy twin if no split entry yet
+            else {                               // both exist: keep the "most done" state
+              prev.recordedSessionId = prev.recordedSessionId || legacy.recordedSessionId;
+              prev.recordedAt = prev.recordedAt || legacy.recordedAt;
+              prev.missedEmailSentAt = prev.missedEmailSentAt || legacy.missedEmailSentAt;
+            }
+            registry.delete(legacyKey);
+          }
+        }
+
         if (prev) {
           const timeMoved = prev.startAt !== n.startAt;
           n.recordedSessionId = timeMoved ? null : prev.recordedSessionId;
           n.recordedAt = timeMoved ? null : prev.recordedAt;
           n.missedEmailSentAt = timeMoved ? null : prev.missedEmailSentAt;
-          n.registeredAt = prev.registeredAt;
+          n.registeredAt = prev.registeredAt || n.registeredAt;
         }
         registry.set(key, n);
         out.push(n);
