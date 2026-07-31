@@ -455,7 +455,18 @@
           className: 'gmr-btn gmr-btn-warning',
           style: 'display: none;',
           onClick: handlePauseButtonClick
-        }, ['Pause'])
+        }, ['Pause']),
+        // Re-prompt for what to share and swap it into the SAME recording. Chrome's own
+        // "Change source" button only exists for getDisplayMedia shares, and the recorder normally
+        // uses chrome.tabCapture (no sharing bar at all), so the presenter had no way to change
+        // what was being captured without stopping and starting a second recording.
+        createDOMElement('button', {
+          id: 'gmr-btn-switch',
+          className: 'gmr-btn',
+          style: 'display: none;',
+          title: 'Share a different tab or window without ending this recording',
+          onClick: handleSwitchButtonClick
+        }, ['Switch'])
       ]),
       
       // Download row
@@ -657,6 +668,67 @@
     });
   }
 
+  // "Switch" — re-prompt for a tab/window/screen and swap it into the running recording.
+  //
+  // The picker itself must be opened from the offscreen document (it owns the MediaStream and the
+  // MediaRecorder), so this only sends the request. Nothing about the current recording is torn down:
+  // if the presenter cancels the picker, recording continues on the existing source untouched.
+  // Restore the Switch button to its idle, clickable state. Called from every exit path — reply,
+  // error, timeout — because a button stuck on "Selecting…" is unrecoverable for the rest of the
+  // recording: updatePanelUI() only manages `display`, so nothing else ever clears `disabled`.
+  function resetSwitchButton() {
+    const btn = document.getElementById('gmr-btn-switch');
+    if (!btn) return;
+    btn.disabled = false;
+    btn.textContent = 'Switch';
+  }
+
+  function handleSwitchButtonClick() {
+    chrome.storage.local.get(['isRecording', 'isPaused'], (data) => {
+      if (!data.isRecording || data.isPaused) return;
+
+      const btn = document.getElementById('gmr-btn-switch');
+      if (btn) { btn.disabled = true; btn.textContent = 'Selecting…'; }
+
+      // Safety net: re-enable even if no reply ever arrives. getDisplayMedia blocks for as long as
+      // the picker is open and some dismissal paths never settle the promise, so the response
+      // callback is not guaranteed to fire. Without this the button wedges permanently.
+      // Generous (3 min) so it never fires while a presenter is still choosing a source.
+      let settled = false;
+      const failsafe = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        resetSwitchButton();
+      }, 180000);
+
+      const finish = (fn) => {
+        if (settled) return;          // failsafe already restored the button
+        settled = true;
+        clearTimeout(failsafe);
+        resetSwitchButton();
+        if (fn) fn();
+      };
+
+      chrome.runtime.sendMessage({ type: 'SWITCH_SOURCE' }, (resp) => {
+        // A dropped channel (offscreen document gone) leaves resp undefined and sets lastError.
+        // Reading it here also stops Chrome logging an unchecked-error warning.
+        const chanErr = chrome.runtime.lastError;
+        finish(() => {
+          if (chanErr || !resp) {
+            showToast('Could not switch source — recording continues on the current source.', 'warn');
+          } else if (resp.success) {
+            showToast('Now sharing the new source. Recording continued without interruption.', 'info');
+          } else if (resp.cancelled) {
+            // Presenter dismissed the picker — not an error, and nothing changed.
+            showToast('Source unchanged — still recording the original source.', 'info');
+          } else {
+            showToast(`Could not switch source${resp.error ? `: ${resp.error}` : ''}. Recording continues on the current source.`, 'warn');
+          }
+        });
+      });
+    });
+  }
+
   function loadAndListenToStorage() {
     chrome.storage.local.get(null, (data) => {
       gmrState = { ...gmrState, ...data };
@@ -701,6 +773,8 @@
     const recordBtn = document.getElementById('gmr-btn-record');
     const pauseBtn = document.getElementById('gmr-btn-pause');
 
+    const switchBtn = document.getElementById('gmr-btn-switch');
+
     if (recordBtn && pauseBtn) {
       if (state.isRecording) {
         recordBtn.style.display = 'none';
@@ -712,6 +786,19 @@
         recordBtn.textContent = 'Start Recording';
         recordBtn.className = 'gmr-btn gmr-btn-primary';
         pauseBtn.style.display = 'none';
+      }
+    }
+
+    // Switch is only meaningful while actively recording. Hidden when paused too: swapping the
+    // source mid-pause would change what resumes without the presenter seeing it happen.
+    if (switchBtn) {
+      const showSwitch = state.isRecording && !state.isPaused;
+      switchBtn.style.display = showSwitch ? 'block' : 'none';
+      // Self-heal: if the button is hidden (recording stopped/paused) while a switch was in flight,
+      // clear the pending state so it is never revealed later still disabled and reading "Selecting…".
+      if (!showSwitch && switchBtn.disabled) {
+        switchBtn.disabled = false;
+        switchBtn.textContent = 'Switch';
       }
     }
     
@@ -1771,17 +1858,59 @@
   // utterance. While the caption for a speaker keeps extending the previously-emitted text (prefix
   // match), we REPLACE that speaker's last line instead of appending; a genuinely new utterance
   // (caption resets to text that is not a continuation) starts a fresh line.
+  // Would `next` be a refinement of the already-emitted `prev` (same utterance), rather than new speech?
+  //
+  // Two accepted shapes:
+  //   1. Pure growth      — "Hi there" -> "Hi there, welcome"           (prefix extension)
+  //   2. Revised tail     — "...it is a terminal language only."
+  //                      -> "...it is a Tamil language, oh good, broad. During the..."
+  //      Google rewrote the last few words of its own guess while keeping everything before them.
+  //
+  // Shape 2 is detected by requiring a long common PREFIX: the revision only ever rewrites the tail,
+  // so if the two strings agree for most of the shorter one's length they are the same sentence. The
+  // threshold is deliberately high (85%) and also requires the new text to be at least as long, so two
+  // different sentences that merely start alike ("Okay, so..." / "Okay, and...") are NOT merged.
+  const UTTERANCE_MATCH_RATIO = 0.65;
+
+  function isSameUtterance(prev, next) {
+    if (!prev || !next) return false;
+    if (next.startsWith(prev)) return true;          // shape 1: pure growth
+
+    // A revision refines and usually lengthens; a genuinely new (shorter) line is not a revision.
+    if (next.length < prev.length) return false;
+
+    // Length of the shared leading run.
+    let i = 0;
+    const max = Math.min(prev.length, next.length);
+    while (i < max && prev[i] === next[i]) i++;
+
+    // Require the shared prefix to cover most of the previously-emitted text. Short texts are excluded
+    // because a few characters of overlap is not evidence of anything.
+    if (prev.length < 25) return false;
+    return (i / prev.length) >= UTTERANCE_MATCH_RATIO;
+  }
+
   function flushStableCaptions() {
     const now = Date.now();
     for (const [speaker, st] of captionState) {
       if (st.text && st.text !== st.emittedText && (now - st.lastChange) >= 1200) {
         const prev = st.emittedText || '';
-        // A continuation extends what we last emitted for this speaker (same utterance still growing).
-        // Once an utterance has been idle long enough that Meet would have torn its block down, treat
-        // the next text as a NEW utterance even if it happens to share a prefix — otherwise a recycled
-        // caption block makes two separate statements look like one growing line.
-        const stale = (now - st.lastChange) >= UTTERANCE_RESET_MS;
-        const isContinuation = prev && !stale && st.text.startsWith(prev);
+        // Is this the SAME utterance still being refined, or genuinely new speech?
+        //
+        // A strict prefix test (text.startsWith(prev)) is not enough. Google's recogniser
+        // RETROACTIVELY REWRITES earlier words as more audio arrives — especially for non-English
+        // speech, where "terminal language only" became "Tamil language, oh good, broad". The revised
+        // text is not a prefix extension, so a prefix-only test called it a new utterance and appended
+        // a near-duplicate of the same sentence. isSameUtterance() also accepts revisions.
+        //
+        // The staleness reset is measured from when the utterance was last EMITTED, not from
+        // lastChange: on a poor connection a caption can sit unchanged for a long time and then keep
+        // growing (one real line here arrived 42s after its start), and keying off lastChange wrongly
+        // declared that a new utterance mid-sentence.
+        const idleSinceEmit = st.lastEmitAt ? (now - st.lastEmitAt) : 0;
+        const stale = st.lastEmitAt ? idleSinceEmit >= UTTERANCE_RESET_MS : false;
+        const isContinuation = !!prev && !stale && isSameUtterance(prev, st.text);
+        st.lastEmitAt = now;
         st.emittedText = st.text;
         // One-shot: tell the server the prior line was stored under the pre-resolution label.
         const renamedFrom = st.renamedFrom || null;

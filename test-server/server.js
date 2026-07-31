@@ -538,8 +538,9 @@ function handleJSONMessage(message, ws, session, remoteAddress) {
             (message.prevSpeaker && /^you$/i.test(message.prevSpeaker) &&
              cand.speaker === message.prevSpeaker);
           if (!sameSpeaker) continue;
-          // Prefix check: the new text must extend (or exactly repeat) what we stored.
-          if (typeof line.text === 'string' && line.text.startsWith(cand.text)) { target = i; }
+          // The new text must be a refinement of what we stored — either a pure extension, or a
+          // retroactive revision of the tail (see isSameUtterance).
+          if (isSameUtterance(cand.text, line.text)) { target = i; }
           break; // only consider this speaker's MOST RECENT line
         }
       }
@@ -575,6 +576,27 @@ function handleJSONMessage(message, ws, session, remoteAddress) {
 // ---------------------------------------------------------------------------
 // HTTP API
 // ---------------------------------------------------------------------------
+// Would `next` be a refinement of `prev` (the same utterance), rather than new speech?
+//
+// Mirrors isSameUtterance() in extension/content.js — keep the two in sync. Google's recogniser
+// retroactively rewrites the tail of its own guess as more audio arrives (pronounced for non-English
+// speech: "terminal language only" -> "Tamil language, oh good, broad"), so a strict prefix test
+// wrongly treats the correction as a new line and stores the same sentence twice. Accepting a long
+// common prefix catches revisions while a high threshold keeps distinct sentences apart.
+const UTTERANCE_MATCH_RATIO = 0.65;
+
+function isSameUtterance(prev, next) {
+  if (typeof prev !== 'string' || typeof next !== 'string' || !prev || !next) return false;
+  if (next.startsWith(prev)) return true;      // pure growth (or exact repeat)
+  if (next.length < prev.length) return false; // a revision refines and usually lengthens
+  if (prev.length < 25) return false;          // too short for overlap to mean anything
+
+  let i = 0;
+  const max = Math.min(prev.length, next.length);
+  while (i < max && prev[i] === next[i]) i++;
+  return (i / prev.length) >= UTTERANCE_MATCH_RATIO;
+}
+
 function sendJson(res, status, body, filename) {
   const payload = JSON.stringify(body, null, 2);
   const headers = {

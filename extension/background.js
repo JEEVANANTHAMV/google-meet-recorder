@@ -129,6 +129,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         case 'RESUME_RECORDING':
           await sendToOffscreen({ type: 'RESUME_RECORDING' }, sendResponse);
           break;
+        case 'SWITCH_SOURCE': {
+          // Presenter asked to share something else. The offscreen document owns the stream, so it
+          // opens the picker and swaps the track; we relay its result verbatim so the in-page button
+          // can distinguish success from a cancelled picker. (sendToOffscreen takes no callback — it
+          // returns the response, which we must forward explicitly.)
+          const result = await sendToOffscreen({ type: 'SWITCH_SOURCE' });
+          sendResponse(result);
+          break;
+        }
         case 'MIC_MUTE_STATE':
           // Faculty muted/unmuted themselves in Google Meet — gate the local mic track in the
           // recorder so a muted mic is not recorded (privacy). No-op if mic capture isn't enabled.

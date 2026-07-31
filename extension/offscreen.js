@@ -63,6 +63,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           });
           sendResponse({ success: true });
           break;
+        case 'SWITCH_SOURCE':
+          sendResponse(await switchSource());
+          break;
         case 'SEND_TRANSCRIPT':
           sendJSONMessage({
             type: 'transcript',
@@ -307,6 +310,101 @@ function handleCaptureInterrupted() {
   stopRecording();
 }
 
+// Presenter-initiated source switch, driven by the "Switch" button in the in-page recorder panel.
+//
+// This is the path that actually matters in practice: the recorder normally captures via
+// chrome.tabCapture, which has no picker and no Chrome sharing bar, so there is no native
+// "Change source" to click. Here we open a fresh picker ourselves and graft the chosen surface onto
+// the RUNNING MediaRecorder.
+//
+// Ordering is deliberate and load-bearing:
+//   1. Prompt FIRST and get the new stream. If the presenter cancels (or the prompt fails), we return
+//      early having touched nothing — the recording keeps going on the original source.
+//   2. Only once we hold a live replacement do we swap tracks and release the old surface.
+// Doing it the other way round (stop old, then prompt) would leave a cancelled picker with a dead
+// recording, which is exactly the "ends the call and saves a new recording" behaviour to avoid.
+// Guards against two pickers being open at once. Cleared in a finally block so it can never leak and
+// permanently block switching — a stuck flag here would be as bad as the stuck button it protects.
+let switchPending = false;
+
+async function switchSource() {
+  // Only one picker at a time. The in-page button disables itself while a switch is pending, but it
+  // recovers on a timeout (and the popup can request a switch too), so a second request can still
+  // arrive while the first picker is open. Opening a competing picker would leave two live shares
+  // racing to become the recorded track.
+  if (switchPending) {
+    return { success: false, error: 'A source picker is already open' };
+  }
+  switchPending = true;
+  try {
+    return await doSwitchSource();
+  } finally {
+    switchPending = false;
+  }
+}
+
+async function doSwitchSource() {
+  if (!mediaRecorder || (mediaRecorder.state !== 'recording' && mediaRecorder.state !== 'paused')) {
+    return { success: false, error: 'Not recording' };
+  }
+
+  let newStream = null;
+  try {
+    newStream = await navigator.mediaDevices.getDisplayMedia({
+      video: { width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 30 } },
+      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, sampleRate: 48000, channelCount: 2 },
+      systemAudio: 'include',
+      surfaceSwitching: 'include'
+    });
+  } catch (err) {
+    // NotAllowedError / AbortError = the presenter dismissed the picker. Not a failure.
+    const cancelled = err && (err.name === 'NotAllowedError' || err.name === 'AbortError');
+    console.log('[GMR Offscreen] Source switch not completed:', err && err.name);
+    return cancelled ? { success: false, cancelled: true } : { success: false, error: (err && err.message) || 'Picker failed' };
+  }
+
+  const newVideo = newStream.getVideoTracks()[0];
+  if (!newVideo) {
+    newStream.getTracks().forEach(t => { try { t.stop(); } catch (_) {} });
+    return { success: false, error: 'Selected source has no video' };
+  }
+
+  try {
+    const oldCapture = captureStream;
+
+    // Swap the video track inside the stream MediaRecorder is already encoding. The recorder is
+    // never stopped or recreated, so the output stays a single continuous file. We re-arm the
+    // listeners ourselves below (after captureStream points at the new stream), and report the
+    // outcome via this function's return value, so both are suppressed here.
+    swapRecordedVideoTrack(newVideo, { rearm: false, notify: false });
+
+    // Point module state at the new capture stream, then re-arm the end-of-capture and
+    // surface-switch listeners on it (the old stream's listeners die with it).
+    captureStream = newStream;
+    attachCaptureEndHandler();
+    attachSurfaceSwitchHandler();
+
+    // Release the previous surface so Chrome drops its capture indicator. Audio tracks of the old
+    // stream are intentionally left alone if they feed the recorded mix — see the note below.
+    if (oldCapture && oldCapture !== newStream) {
+      for (const t of oldCapture.getVideoTracks()) {
+        try { t.stop(); } catch (_) {}
+      }
+    }
+
+    // NOTE: audio is deliberately NOT re-plumbed. The recorded audio graph was built at start-up
+    // (tab/system audio + optional mic, mixed in buildRecordingStream) and keeps running through the
+    // switch, so the meeting audio and the presenter's voice continue without a gap. Re-wiring the
+    // AudioContext mid-recording would risk a silent stretch, which is far worse than not capturing
+    // the newly-shared surface's own system audio.
+    console.log('[GMR Offscreen] Source switched by presenter ->', newVideo.label);
+    return { success: true, label: newVideo.label || '' };
+  } catch (err) {
+    console.error('[GMR Offscreen] Source switch failed during swap:', err);
+    return { success: false, error: (err && err.message) || 'Swap failed' };
+  }
+}
+
 // ==================== SURFACE SWITCHING ("Change source") ====================
 //
 // With surfaceSwitching:'include', Chrome lets the presenter switch the shared tab/window mid-share.
@@ -352,7 +450,12 @@ function attachSurfaceSwitchHandler() {
 }
 
 // Move a newly-shared surface into the live recording stream, keeping MediaRecorder running.
-function swapRecordedVideoTrack(newTrack) {
+// `opts.rearm` is false when the caller will re-point captureStream itself and re-arm the listeners
+// afterwards (the presenter-initiated switchSource path) — re-arming here would bind the handler to
+// the OLD stream's now-dead track. `opts.notify` is false to suppress the duplicate user-facing
+// message when the caller already reports the outcome.
+function swapRecordedVideoTrack(newTrack, opts = {}) {
+  const { rearm = true, notify = true } = opts;
   if (!stream || !newTrack) return;
 
   // Suppress the interruption alarm while the outgoing track tears down. Cleared on a timer rather
@@ -369,19 +472,21 @@ function swapRecordedVideoTrack(newTrack) {
       try { t.stop(); } catch (_) { /* already ended */ }
     }
 
-    // The new track lives on captureStream; keep the end-of-capture handler pointed at it so a later
-    // "Stop sharing" is still detected.
-    attachCaptureEndHandler();
+    // Keep the end-of-capture handler pointed at the live track so a later "Stop sharing" is still
+    // detected. Skipped when the caller is about to swap captureStream itself.
+    if (rearm) attachCaptureEndHandler();
 
     console.log('[GMR Offscreen] Switched recorded surface ->', newTrack.label,
       '| recorder state:', mediaRecorder ? mediaRecorder.state : 'none');
 
     // Tell the user the switch was captured, and that the recording was NOT interrupted.
-    chrome.runtime.sendMessage({
-      type: 'SURFACE_SWITCHED',
-      meetingId,
-      label: newTrack.label || ''
-    });
+    if (notify) {
+      chrome.runtime.sendMessage({
+        type: 'SURFACE_SWITCHED',
+        meetingId,
+        label: newTrack.label || ''
+      });
+    }
   } catch (err) {
     // A failed swap must not kill an in-progress recording; audio and prior video are still intact.
     console.error('[GMR Offscreen] Failed to swap recorded surface:', err);
