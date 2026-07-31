@@ -583,18 +583,46 @@ function handleJSONMessage(message, ws, session, remoteAddress) {
 // speech: "terminal language only" -> "Tamil language, oh good, broad"), so a strict prefix test
 // wrongly treats the correction as a new line and stores the same sentence twice. Accepting a long
 // common prefix catches revisions while a high threshold keeps distinct sentences apart.
-const UTTERANCE_MATCH_RATIO = 0.65;
+const UTTERANCE_MATCH_RATIO = 0.65;   // shared leading characters, as a fraction of prev
+const UTTERANCE_WORD_RATIO = 0.75;    // shared words (in order), as a fraction of prev's words
+const UTTERANCE_SHRINK_MIN = 0.8;     // a revision may shorten to this fraction of prev
 
 function isSameUtterance(prev, next) {
   if (typeof prev !== 'string' || typeof next !== 'string' || !prev || !next) return false;
   if (next.startsWith(prev)) return true;      // pure growth (or exact repeat)
-  if (next.length < prev.length) return false; // a revision refines and usually lengthens
   if (prev.length < 25) return false;          // too short for overlap to mean anything
+  // A revision can SHORTEN the tail ("… I think." -> "… Okay."), so allow a modest shrink while still
+  // rejecting a genuinely new short line after a long one.
+  if (next.length < prev.length * UTTERANCE_SHRINK_MIN) return false;
 
   let i = 0;
   const max = Math.min(prev.length, next.length);
   while (i < max && prev[i] === next[i]) i++;
-  return (i / prev.length) >= UTTERANCE_MATCH_RATIO;
+  if ((i / prev.length) >= UTTERANCE_MATCH_RATIO) return true;
+
+  // Google also rewrites words near the START of its guess, which destroys the character prefix while
+  // keeping most words in order.
+  return wordOverlapRatio(prev, next) >= UTTERANCE_WORD_RATIO;
+}
+
+// Fraction of `prev`'s words appearing, in order, near the start of `next` (word-level LCS). Bounded
+// so it stays cheap. Mirrors wordOverlapRatio() in extension/content.js — keep the two in sync.
+function wordOverlapRatio(prev, next) {
+  const words = (s) => s.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, ' ').split(/\s+/).filter(Boolean);
+  const A = words(prev).slice(0, 60);
+  if (!A.length) return 0;
+  const B = words(next).slice(0, Math.min(A.length + 8, 68));
+  if (!B.length) return 0;
+
+  let prevRow = new Array(B.length + 1).fill(0);
+  for (let x = 1; x <= A.length; x++) {
+    const row = new Array(B.length + 1).fill(0);
+    for (let y = 1; y <= B.length; y++) {
+      row[y] = A[x - 1] === B[y - 1] ? prevRow[y - 1] + 1 : Math.max(prevRow[y], row[y - 1]);
+    }
+    prevRow = row;
+  }
+  return prevRow[B.length] / A.length;
 }
 
 function sendJson(res, status, body, filename) {

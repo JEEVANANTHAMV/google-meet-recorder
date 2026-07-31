@@ -1726,9 +1726,15 @@
   // speaker and only emit a line once it has STABILIZED (no change for ~1.2s) — that yields one
   // clean line per utterance in near real time, instead of flooding the server with partials.
 
-  // A caption that has not changed for this long is a finished utterance: the next text under the
-  // same speaker starts a fresh line rather than being treated as a continuation of it.
-  const UTTERANCE_RESET_MS = 15000;
+  // A caption that has not changed for this long is treated as a finished utterance: the next text
+  // under the same speaker starts a fresh line rather than continuing it.
+  //
+  // This is only a SAFETY NET, not the primary test — unrelated speech is already rejected by
+  // isSameUtterance(), so this window exists purely to stop a recycled caption block from merging two
+  // genuinely separate statements that happen to look similar. It was 15s, which split real sentences:
+  // on a poor connection one observed utterance kept growing after an 18.7s gap. Being generous here
+  // costs almost nothing (similarity still has to pass) while being stingy corrupts real transcripts.
+  const UTTERANCE_RESET_MS = 60000;
 
   // speaker -> { text, lastChange, emittedText }
   const captionState = new Map();
@@ -1870,24 +1876,52 @@
   // so if the two strings agree for most of the shorter one's length they are the same sentence. The
   // threshold is deliberately high (85%) and also requires the new text to be at least as long, so two
   // different sentences that merely start alike ("Okay, so..." / "Okay, and...") are NOT merged.
-  const UTTERANCE_MATCH_RATIO = 0.65;
+  const UTTERANCE_MATCH_RATIO = 0.65;   // shared leading characters, as a fraction of prev
+  const UTTERANCE_WORD_RATIO = 0.75;    // shared words (in order), as a fraction of prev's words
+  const UTTERANCE_SHRINK_MIN = 0.8;     // a revision may shorten to this fraction of prev
 
   function isSameUtterance(prev, next) {
     if (!prev || !next) return false;
     if (next.startsWith(prev)) return true;          // shape 1: pure growth
+    if (prev.length < 25) return false;              // too short for overlap to mean anything
 
-    // A revision refines and usually lengthens; a genuinely new (shorter) line is not a revision.
-    if (next.length < prev.length) return false;
+    // A revision can SHORTEN the text — "…close the call. I think." became "…close the call. Okay."
+    // An earlier version required next to be at least as long, which rejected exactly that. Allow a
+    // modest shrink, but still reject a genuinely new short line following a long one.
+    if (next.length < prev.length * UTTERANCE_SHRINK_MIN) return false;
 
-    // Length of the shared leading run.
+    // Shared leading characters — catches revisions confined to the tail.
     let i = 0;
     const max = Math.min(prev.length, next.length);
     while (i < max && prev[i] === next[i]) i++;
+    if ((i / prev.length) >= UTTERANCE_MATCH_RATIO) return true;
 
-    // Require the shared prefix to cover most of the previously-emitted text. Short texts are excluded
-    // because a few characters of overlap is not evidence of anything.
-    if (prev.length < 25) return false;
-    return (i / prev.length) >= UTTERANCE_MATCH_RATIO;
+    // Google also rewrites words near the START of its guess ("Great images. Create images crossbody"
+    // -> "create images, create images"), which destroys the character prefix while keeping most words
+    // in order. Fall back to an order-preserving word overlap so those revisions are still recognised.
+    return wordOverlapRatio(prev, next) >= UTTERANCE_WORD_RATIO;
+  }
+
+  // Fraction of `prev`'s words that appear, in order, near the start of `next` (longest common
+  // subsequence over normalised words). Bounded so this stays cheap on long captions.
+  function wordOverlapRatio(prev, next) {
+    const words = (s) => s.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, ' ').split(/\s+/).filter(Boolean);
+    const A = words(prev).slice(0, 60);
+    if (!A.length) return 0;
+    // Only look at next's opening region: a revision rewrites what was already said, it does not
+    // reorder the whole sentence.
+    const B = words(next).slice(0, Math.min(A.length + 8, 68));
+    if (!B.length) return 0;
+
+    let prevRow = new Array(B.length + 1).fill(0);
+    for (let x = 1; x <= A.length; x++) {
+      const row = new Array(B.length + 1).fill(0);
+      for (let y = 1; y <= B.length; y++) {
+        row[y] = A[x - 1] === B[y - 1] ? prevRow[y - 1] + 1 : Math.max(prevRow[y], row[y - 1]);
+      }
+      prevRow = row;
+    }
+    return prevRow[B.length] / A.length;
   }
 
   function flushStableCaptions() {
