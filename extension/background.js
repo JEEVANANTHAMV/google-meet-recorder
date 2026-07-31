@@ -129,15 +129,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         case 'RESUME_RECORDING':
           await sendToOffscreen({ type: 'RESUME_RECORDING' }, sendResponse);
           break;
-        case 'SWITCH_SOURCE': {
-          // Presenter asked to share something else. The offscreen document owns the stream, so it
-          // opens the picker and swaps the track; we relay its result verbatim so the in-page button
-          // can distinguish success from a cancelled picker. (sendToOffscreen takes no callback — it
-          // returns the response, which we must forward explicitly.)
-          const result = await sendToOffscreen({ type: 'SWITCH_SOURCE' });
-          sendResponse(result);
-          break;
-        }
         case 'MIC_MUTE_STATE':
           // Faculty muted/unmuted themselves in Google Meet — gate the local mic track in the
           // recorder so a muted mic is not recorded (privacy). No-op if mic capture isn't enabled.
@@ -195,8 +186,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         case 'CAPTURE_INTERRUPTED':
           await handleCaptureInterrupted(message, sendResponse);
           break;
-        case 'SURFACE_SWITCHED':
-          await handleSurfaceSwitched(message, sendResponse);
+        case 'CAPTURE_DEGRADED':
+          await handleCaptureDegraded(message, sendResponse);
           break;
         case 'AUTH_FAILED':
           await handleAuthFailed(message, sendResponse);
@@ -586,29 +577,36 @@ async function handleRecordingSaved(message, sendResponse) {
 // notification (or its button) re-starts the recording via startRecordingAfterInterruption().
 const INTERRUPT_NOTIFICATION_ID = 'gmr-capture-interrupted';
 
-// The presenter used Chrome's "Change source" to share a different tab/window. The recording
-// continued uninterrupted (offscreen swapped the video track in place), so this is purely
-// informational — the important part is NOT raising the "recording interrupted" alarm, which is what
-// a source switch used to look like before surface switching was supported.
-async function handleSurfaceSwitched(message, sendResponse) {
-  console.log('[GMR] Shared surface switched, recording continues:', message.label || '(unnamed)');
+// Screen sharing stopped but the recording is still running (audio and/or transcript continue).
+// Crucially this does NOT clear isRecording — the session stays open and keeps streaming to the
+// server, so stopping a share no longer costs the user their recording. Informational only.
+async function handleCaptureDegraded(message, sendResponse) {
+  const kinds = Array.isArray(message.liveKinds) ? message.liveKinds : [];
+  console.warn('[GMR] Screen sharing stopped; recording continues on:', kinds.join(' + ') || 'transcript only');
 
-  // Clear any stale interruption state so the popup doesn't keep showing a resume prompt.
+  // Clear any stale interruption flag so the popup doesn't show a resume prompt for a live recording.
   await chrome.storage.local.set({ recordingInterrupted: false });
   try { chrome.notifications.clear(INTERRUPT_NOTIFICATION_ID); } catch (_) { /* ignore */ }
 
-  // Record it in the activity log using the same {event, name, timestamp} shape as participant events.
   const data = await chrome.storage.local.get(['activityLog']);
   const activityLog = data.activityLog || [];
   activityLog.unshift({
-    event: 'surface_switched',
-    name: message.label || 'new source',
+    event: 'capture_degraded',
+    name: kinds.includes('audio') ? 'screen share stopped (audio still recording)' : 'screen share stopped',
     timestamp: new Date().toISOString()
   });
   if (activityLog.length > 100) activityLog.length = 100;
   await chrome.storage.local.set({ activityLog });
 
-  await broadcastToPopups({ type: 'SURFACE_SWITCHED_POPUP', label: message.label || '' });
+  await broadcastToPopups({ type: 'CAPTURE_DEGRADED_POPUP', liveKinds: kinds });
+
+  // Let the in-page panel say so, since that is where the user is looking.
+  const stored = await chrome.storage.local.get(['recordedTabId']);
+  if (stored.recordedTabId != null) {
+    try {
+      chrome.tabs.sendMessage(stored.recordedTabId, { type: 'CAPTURE_DEGRADED_NOTICE', liveKinds: kinds });
+    } catch (e) { /* ignore */ }
+  }
 
   if (sendResponse) sendResponse({ success: true });
 }

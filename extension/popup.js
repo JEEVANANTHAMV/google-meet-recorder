@@ -474,10 +474,9 @@ function handleRuntimeMessage(message, sender, sendResponse) {
       renderRecordingCard();
       break;
     
-    case 'SURFACE_SWITCHED_POPUP':
-      // The presenter used Chrome's "Change source" to share a different tab/window. The recording
-      // continued through the swap, so clear any stale interruption error rather than leaving the
-      // "your recording is broken" message on screen.
+    case 'CAPTURE_DEGRADED_POPUP':
+      // Screen sharing stopped but the recording is still running. Clear any stale "broken recording"
+      // error and keep the recording state as-is — do NOT flip isRecording off.
       state.recordingError = null;
       renderRecordingCard();
       break;

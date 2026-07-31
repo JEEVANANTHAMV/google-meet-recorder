@@ -455,18 +455,7 @@
           className: 'gmr-btn gmr-btn-warning',
           style: 'display: none;',
           onClick: handlePauseButtonClick
-        }, ['Pause']),
-        // Re-prompt for what to share and swap it into the SAME recording. Chrome's own
-        // "Change source" button only exists for getDisplayMedia shares, and the recorder normally
-        // uses chrome.tabCapture (no sharing bar at all), so the presenter had no way to change
-        // what was being captured without stopping and starting a second recording.
-        createDOMElement('button', {
-          id: 'gmr-btn-switch',
-          className: 'gmr-btn',
-          style: 'display: none;',
-          title: 'Share a different tab or window without ending this recording',
-          onClick: handleSwitchButtonClick
-        }, ['Switch'])
+        }, ['Pause'])
       ]),
       
       // Download row
@@ -673,62 +662,6 @@
   // The picker itself must be opened from the offscreen document (it owns the MediaStream and the
   // MediaRecorder), so this only sends the request. Nothing about the current recording is torn down:
   // if the presenter cancels the picker, recording continues on the existing source untouched.
-  // Restore the Switch button to its idle, clickable state. Called from every exit path — reply,
-  // error, timeout — because a button stuck on "Selecting…" is unrecoverable for the rest of the
-  // recording: updatePanelUI() only manages `display`, so nothing else ever clears `disabled`.
-  function resetSwitchButton() {
-    const btn = document.getElementById('gmr-btn-switch');
-    if (!btn) return;
-    btn.disabled = false;
-    btn.textContent = 'Switch';
-  }
-
-  function handleSwitchButtonClick() {
-    chrome.storage.local.get(['isRecording', 'isPaused'], (data) => {
-      if (!data.isRecording || data.isPaused) return;
-
-      const btn = document.getElementById('gmr-btn-switch');
-      if (btn) { btn.disabled = true; btn.textContent = 'Selecting…'; }
-
-      // Safety net: re-enable even if no reply ever arrives. getDisplayMedia blocks for as long as
-      // the picker is open and some dismissal paths never settle the promise, so the response
-      // callback is not guaranteed to fire. Without this the button wedges permanently.
-      // Generous (3 min) so it never fires while a presenter is still choosing a source.
-      let settled = false;
-      const failsafe = setTimeout(() => {
-        if (settled) return;
-        settled = true;
-        resetSwitchButton();
-      }, 180000);
-
-      const finish = (fn) => {
-        if (settled) return;          // failsafe already restored the button
-        settled = true;
-        clearTimeout(failsafe);
-        resetSwitchButton();
-        if (fn) fn();
-      };
-
-      chrome.runtime.sendMessage({ type: 'SWITCH_SOURCE' }, (resp) => {
-        // A dropped channel (offscreen document gone) leaves resp undefined and sets lastError.
-        // Reading it here also stops Chrome logging an unchecked-error warning.
-        const chanErr = chrome.runtime.lastError;
-        finish(() => {
-          if (chanErr || !resp) {
-            showToast('Could not switch source — recording continues on the current source.', 'warn');
-          } else if (resp.success) {
-            showToast('Now sharing the new source. Recording continued without interruption.', 'info');
-          } else if (resp.cancelled) {
-            // Presenter dismissed the picker — not an error, and nothing changed.
-            showToast('Source unchanged — still recording the original source.', 'info');
-          } else {
-            showToast(`Could not switch source${resp.error ? `: ${resp.error}` : ''}. Recording continues on the current source.`, 'warn');
-          }
-        });
-      });
-    });
-  }
-
   function loadAndListenToStorage() {
     chrome.storage.local.get(null, (data) => {
       gmrState = { ...gmrState, ...data };
@@ -773,8 +706,6 @@
     const recordBtn = document.getElementById('gmr-btn-record');
     const pauseBtn = document.getElementById('gmr-btn-pause');
 
-    const switchBtn = document.getElementById('gmr-btn-switch');
-
     if (recordBtn && pauseBtn) {
       if (state.isRecording) {
         recordBtn.style.display = 'none';
@@ -789,19 +720,6 @@
       }
     }
 
-    // Switch is only meaningful while actively recording. Hidden when paused too: swapping the
-    // source mid-pause would change what resumes without the presenter seeing it happen.
-    if (switchBtn) {
-      const showSwitch = state.isRecording && !state.isPaused;
-      switchBtn.style.display = showSwitch ? 'block' : 'none';
-      // Self-heal: if the button is hidden (recording stopped/paused) while a switch was in flight,
-      // clear the pending state so it is never revealed later still disabled and reading "Selecting…".
-      if (!showSwitch && switchBtn.disabled) {
-        switchBtn.disabled = false;
-        switchBtn.textContent = 'Switch';
-      }
-    }
-    
     // Download controls
     const downloadRow = document.getElementById('gmr-download-row');
     const downloadBtn = document.getElementById('gmr-btn-download');
@@ -2194,6 +2112,19 @@
         showResumePrompt();
         sendResponse({ success: true });
         break;
+      case 'CAPTURE_DEGRADED_NOTICE': {
+        // Screen sharing stopped but the recording is STILL RUNNING. Deliberately a mild info toast,
+        // not the resume prompt: there is nothing for the user to fix and the session is intact.
+        const kinds = Array.isArray(message.liveKinds) ? message.liveKinds : [];
+        showToast(
+          kinds.includes('audio')
+            ? 'Screen sharing stopped. Still recording audio, transcript and participants — the recording was not interrupted.'
+            : 'Screen sharing stopped. Still capturing transcript and participants — the recording was not interrupted.',
+          'info'
+        );
+        sendResponse({ success: true });
+        break;
+      }
       default:
         break;
     }
