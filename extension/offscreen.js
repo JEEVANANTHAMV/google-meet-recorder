@@ -69,6 +69,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             speaker: message.speaker,
             text: message.text,
             timestamp: message.timestamp,
+            // Carries the caption-growth supersede flag through to the server, which replaces the
+            // speaker's previous line instead of appending a longer duplicate. Dropping it here
+            // silently disabled server-side dedup even though the server implements it.
+            replace: !!message.replace,
+            // Set when the local user's caption label resolved from "You" to their real name
+            // mid-utterance; lets the server supersede the line stored under the old label.
+            prevSpeaker: message.prevSpeaker || null,
             meetingId: meetingId
           });
           sendResponse({ success: true });

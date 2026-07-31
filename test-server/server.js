@@ -511,10 +511,51 @@ function handleJSONMessage(message, ws, session, remoteAddress) {
       // we supersede this speaker's previous line instead of appending every growth step (which used
       // to bloat long transcripts to multiple MB and break summarisation). Guard: only replace when
       // the last stored line is the same speaker AND the new text extends it (defensive prefix check).
-      const last = session.transcript[session.transcript.length - 1];
-      if (message.replace && last && last.speaker === line.speaker &&
-          typeof line.text === 'string' && line.text.startsWith(last.text)) {
-        session.transcript[session.transcript.length - 1] = line;
+      // Meet labels the local user's captions "You"; the extension resolves that to the real display
+      // name, which can happen mid-utterance. It then sends prevSpeaker so we recognise the stored
+      // line as the same person and supersede it, instead of leaving an orphaned "You" duplicate.
+      // Only the specific prior label is accepted — we never match on text alone, which could let one
+      // speaker's line overwrite another's.
+      //
+      // We search for THIS SPEAKER'S most recent line rather than only inspecting the tail. Meet keeps
+      // a finished caption block mounted while someone else starts talking, so a re-scan can re-emit
+      // it after another speaker's line has landed. Checking only the tail then saw a speaker
+      // mismatch, skipped the supersede and appended a verbatim duplicate — which is exactly the
+      // "duplicates whenever the next speaker speaks" symptom.
+      //
+      // The search is bounded to the last few lines: a supersede is only ever meant to revise a
+      // still-recent utterance, and scanning the whole transcript could resurrect an old line.
+      const SUPERSEDE_LOOKBACK = 4;
+      let target = -1;
+      if (message.replace) {
+        const from = Math.max(0, session.transcript.length - SUPERSEDE_LOOKBACK);
+        for (let i = session.transcript.length - 1; i >= from; i--) {
+          const cand = session.transcript[i];
+          // prevSpeaker exists solely for the local user's label resolving from Meet's literal "You"
+          // to their real display name. Accepting an arbitrary prevSpeaker would let any speaker claim
+          // another's line, so only that specific self-relabel is honoured.
+          const sameSpeaker = cand.speaker === line.speaker ||
+            (message.prevSpeaker && /^you$/i.test(message.prevSpeaker) &&
+             cand.speaker === message.prevSpeaker);
+          if (!sameSpeaker) continue;
+          // Prefix check: the new text must extend (or exactly repeat) what we stored.
+          if (typeof line.text === 'string' && line.text.startsWith(cand.text)) { target = i; }
+          break; // only consider this speaker's MOST RECENT line
+        }
+      }
+
+      // Belt-and-braces: an exact repeat of this speaker's recent text is always a re-scan artefact,
+      // never new speech. Drop it outright even if the prefix/lookback logic above didn't match.
+      const isExactRepeat = session.transcript.slice(-SUPERSEDE_LOOKBACK).some(
+        l => l.speaker === line.speaker && l.text === line.text
+      );
+
+      if (target >= 0) {
+        // Preserve the original start time — the utterance began when we first saw it.
+        line.timestamp = session.transcript[target].timestamp || line.timestamp;
+        session.transcript[target] = line;
+      } else if (isExactRepeat) {
+        logger.debug({ sessionId: session.id, speaker: line.speaker }, 'Dropped duplicate caption re-emit');
       } else {
         session.transcript.push(line);
       }

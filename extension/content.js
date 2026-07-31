@@ -958,6 +958,19 @@
       'button[aria-label*="end call" i], button[aria-label*="salir de la llamada" i]'
     );
     if (leaveBtn) return true;
+
+    // The green room ALSO renders mic/camera toggles, so the toggle fallback alone reported
+    // "in call" before joining — which let pre-join UI (the effects panel) enter the roster with a
+    // join timestamp earlier than the real participants'. Reject the lobby explicitly first.
+    const joinBtn = document.querySelector(
+      'button[aria-label*="join now" i], button[aria-label*="ask to join" i], ' +
+      'button[aria-label*="switch here" i], button[aria-label*="return to home screen" i]'
+    );
+    if (joinBtn) return false;
+    if (/\b(join now|ask to join|ready to join|getting ready)\b/i.test(document.body.innerText || '')) {
+      return false;
+    }
+
     // Fallback: the in-call toolbar exposes mic/camera toggles.
     const micBtn = document.querySelector(
       'button[aria-label*="turn off microphone" i], button[aria-label*="turn on microphone" i], ' +
@@ -991,8 +1004,18 @@
       document.querySelectorAll('[data-participant-id]').forEach(el => addName(extractNameFromContainer(el)));
     }
 
-    // ALWAYS include the local user — data-self-name is authoritative.
-    addName(getSelfName());
+    // ALWAYS include the local user.
+    //
+    // This used to call getSelfName() (data-self-name only), which silently dropped the recorder
+    // from their own roster whenever that attribute was absent — it is tied to the self VIDEO TILE,
+    // so it disappears while screen-sharing, in speaker/audio-only layouts, and when the self tile is
+    // scrolled out of a large grid. The People-panel row for yourself is no help either: it reads
+    // "You", which isPlausibleName rejects as UI noise. Net effect: the host could be present for the
+    // entire call and never appear in participants.json.
+    //
+    // resolveSelfName() tries data-self-name AND the panel's "(You)" row, and caches the first hit,
+    // so once we have learned the local user's name they stay in every later snapshot.
+    addName(resolveSelfName());
 
     return found;
   }
@@ -1002,13 +1025,87 @@
     return el ? cleanName(el.getAttribute('data-self-name')) : null;
   }
 
+  // Resolve the local user's real display name, for attributing captions that Meet labels "You".
+  //
+  // data-self-name is authoritative but is not always in the DOM (it appears with the self tile, and
+  // is absent while screen-sharing or in audio-only layouts). So we fall back to the People panel row
+  // marked "(You)", and CACHE the first good answer: captions must not flip between "You" and the
+  // real name mid-meeting depending on which tiles happen to be mounted.
+  let resolvedSelfName = null;
+
+  function resolveSelfName() {
+    if (resolvedSelfName) return resolvedSelfName;
+
+    // 1) data-self-name — authoritative.
+    const direct = getSelfName();
+    if (direct && isPlausibleName(direct)) {
+      resolvedSelfName = direct;
+      return resolvedSelfName;
+    }
+
+    // 2) People panel row whose raw aria-label/text carries the "(You)" marker. cleanName() strips
+    //    that suffix, so we must test the RAW string before cleaning to know which row is ours.
+    const container = findPeoplePanelContainer();
+    if (container) {
+      for (const item of container.querySelectorAll('[role="listitem"]')) {
+        if (isPanelSectionHeader(item)) continue;
+        const raw = `${item.getAttribute('aria-label') || ''} ${item.textContent || ''}`;
+        if (!/\(\s*you\s*\)|\byou\b\s*$/i.test(raw)) continue;
+        const nm = extractPanelName(item);
+        if (nm && isPlausibleName(nm) && !/^you$/i.test(nm)) {
+          resolvedSelfName = nm;
+          console.log('[GMR Content] Self-name resolved from People panel:', resolvedSelfName);
+          return resolvedSelfName;
+        }
+      }
+    }
+
+    // 3) The account switcher / profile chrome carries the signed-in user's name even when no self
+    //    tile is mounted. Last resort before giving up.
+    const acct = document.querySelector(
+      '[aria-label*="Google Account" i], [aria-label*="Account:" i], a[aria-label*="Google Account" i]'
+    );
+    if (acct) {
+      // Labels read like "Google Account: Devops Beta (devops@example.com)".
+      const m = (acct.getAttribute('aria-label') || '').match(/(?:Google Account|Account):\s*([^(\n]+)/i);
+      const nm = m && cleanName(m[1]);
+      if (nm && isPlausibleName(nm) && !/^you$/i.test(nm)) {
+        resolvedSelfName = nm;
+        console.log('[GMR Content] Self-name resolved from account chrome:', resolvedSelfName);
+        return resolvedSelfName;
+      }
+    }
+
+    return null;
+  }
+
+  // Meet labels the local user's captions "You" (and some locales "You (You)"). Map that to the real
+  // name when we can resolve it; otherwise leave it as-is rather than inventing an attribution.
+  function isSelfSpeakerLabel(s) {
+    return !!s && /^you$/i.test(String(s).trim());
+  }
+
+  function normalizeSpeaker(speaker) {
+    if (!isSelfSpeakerLabel(speaker)) return speaker;
+    return resolveSelfName() || speaker;
+  }
+
   // Locate the People / participants side panel container (where names are listed cleanly).
+  //
+  // The label match must be POSITIVE and EXCLUSIVE: an unlabelled [role="list"] used to match the
+  // empty-label test vacuously, so the "Backgrounds and effects" side panel was read as a roster.
+  // Require a people-word in the label, and explicitly reject other side panels that also contain
+  // listitems (effects, chat, activities, host controls).
+  const NOT_PEOPLE_PANEL = /background|effect|chat|activit|host control|whiteboard|breakout|poll|q&a|caption|layout|setting/i;
+
   function findPeoplePanelContainer() {
     const nodes = document.querySelectorAll(
       '[role="region"], [role="dialog"], [role="complementary"], [role="list"]'
     );
     for (const n of nodes) {
       const label = (n.getAttribute('aria-label') || '').toLowerCase();
+      if (!label) continue;                                  // unlabelled list: can't confirm it's People
+      if (NOT_PEOPLE_PANEL.test(label)) continue;            // a different side panel
       if (/people|participant|contributor/.test(label) && n.querySelector('[role="listitem"]')) {
         return n;
       }
@@ -1036,6 +1133,10 @@
   }
 
   // Read participant names from the People panel. Returns an array of display names, or null.
+  //
+  // Returning null (not []) when nothing usable was found matters: snapshotParticipants() treats a
+  // non-empty array as authoritative and skips the video-tile fallback. A panel holding only section
+  // headers must therefore read as "unreadable", not as "an empty meeting".
   function readPeoplePanel() {
     const container = findPeoplePanelContainer();
     if (!container) return null;
@@ -1049,8 +1150,31 @@
     return names.length ? names : null;
   }
 
+  // Is this [role="listitem"] a People-panel SECTION HEADER rather than a participant row?
+  // Meet's panel is a flat list: headers ("1 joined", "0 also invited") sit as listitem siblings of
+  // the real rows. Real rows always have an identity hook or interactive/avatar content.
+  function isPanelSectionHeader(item) {
+    if (!item) return true;
+    // Positive identity hook -> definitely a real participant row.
+    if (item.hasAttribute('data-participant-id') || item.querySelector('[data-participant-id]')) {
+      return false;
+    }
+    // Real rows carry per-participant controls or an avatar image.
+    if (item.querySelector('button, [role="button"], img, [data-self-name]')) return false;
+    // No hooks at all: if the whole row reads as "<count> <status>", it's a header.
+    const text = cleanName(item.textContent) || '';
+    if (/^\d+\s+\S/.test(text)) return true;
+    // Otherwise treat a hook-less row as a header only when it has no name-like text left.
+    return !isPlausibleName(text);
+  }
+
   // Extract one participant's name from a People-panel row.
   function extractPanelName(item) {
+    // A real participant row carries an identity hook (data-participant-id) or an avatar/button
+    // subtree. Section headers ("1 joined") have neither — skip them structurally, before any
+    // text heuristics get a chance to mistake the header text for a name.
+    if (isPanelSectionHeader(item)) return null;
+
     // The row's aria-label is usually the participant's name (e.g. "Jane Doe", "Jane Doe (You)").
     const label = cleanName(item.getAttribute('aria-label'));
     if (label && isPlausibleName(label)) return label;
@@ -1130,7 +1254,19 @@
     /^others\b/i,                        // "Others might..."
     /notetaker|note taker|note-taker/i,  // the recorder bot itself
     /\bpanel\b/i,                        // "...panel"
-    /\bfull video\b/i
+    /\bfull video\b/i,
+    // People-panel SECTION HEADERS. Meet renders these as [role="listitem"] siblings of the real
+    // participant rows, so they were being stored as participants ("1 joined", "0 also invited").
+    // A leading count + status word is never a person's name.
+    /^\d+\s+(joined|also invited|invited|in call|in the call|waiting|contributors?)\b/i,
+    /^(joined|also invited|invited|waiting to join|in this call|contributors?)$/i,
+    // Effects / background side panel leaking in as a "participant". Meet exposes BOTH the human
+    // label ("Backgrounds and effects") and internal snake_case identifiers ("visual_effects") —
+    // treat [_-] and whitespace as interchangeable so one pattern covers every casing Meet uses.
+    /backgrounds?[\s_-]*and[\s_-]*effects|visual[\s_-]*effects|apply[\s_-]*(a[\s_-]*)?(background|effect)/i,
+    // Any snake_case / kebab-case token is a Meet internal identifier, never a display name.
+    // Real names contain spaces or are single words; they never contain underscores.
+    /^[a-z0-9]+(?:[_-][a-z0-9]+)+$/i
   ];
 
   function isUiPhraseNoise(s) {
@@ -1503,6 +1639,10 @@
   // speaker and only emit a line once it has STABILIZED (no change for ~1.2s) — that yields one
   // clean line per utterance in near real time, instead of flooding the server with partials.
 
+  // A caption that has not changed for this long is a finished utterance: the next text under the
+  // same speaker starts a fresh line rather than being treated as a continuation of it.
+  const UTTERANCE_RESET_MS = 15000;
+
   // speaker -> { text, lastChange, emittedText }
   const captionState = new Map();
   let captionStabilizeTimer = null;
@@ -1582,12 +1722,18 @@
       const header = img.parentElement;
       if (!header) return;
       const block = header.parentElement || header;
-      const speaker = cleanName(header.textContent) || 'Unknown';
+      const rawSpeaker = cleanName(header.textContent) || 'Unknown';
       let text = (block.textContent || '').trim();
-      if (speaker && speaker !== 'Unknown' && text.startsWith(speaker)) {
-        text = text.slice(speaker.length);
+      // Strip the speaker label off the front of the block text using the RAW label, since that is
+      // what actually appears in the DOM ("You"), not the resolved display name.
+      if (rawSpeaker && rawSpeaker !== 'Unknown' && text.startsWith(rawSpeaker)) {
+        text = text.slice(rawSpeaker.length);
       }
       text = text.replace(/^[\s:–-]+/, '').trim();
+      // Attribute the local user's captions to their real name instead of Meet's literal "You".
+      // Normalizing HERE (not at emit time) keeps captionState keyed by one stable identity, so a
+      // name that resolves mid-utterance can't split one speaker into two growth chains.
+      const speaker = normalizeSpeaker(rawSpeaker);
       if (text) blocks.push({ speaker, text });
     });
 
@@ -1598,6 +1744,18 @@
     }
 
     for (const b of blocks) {
+      // If this speaker was previously tracked under the literal "You" (self-name resolved only
+      // after captions started), carry that growth state over to the real name. Without this the
+      // in-flight utterance would restart under a new key and get appended as a duplicate line
+      // instead of superseding — the exact bloat the replace mechanism exists to prevent.
+      if (b.speaker !== 'You' && !captionState.has(b.speaker) && captionState.has('You')) {
+        const carried = captionState.get('You');
+        // Remember the old label only if a line was already emitted under it, so the server can
+        // supersede that stored line rather than stranding it.
+        if (carried.emittedText) carried.renamedFrom = 'You';
+        captionState.set(b.speaker, carried);
+        captionState.delete('You');
+      }
       const st = captionState.get(b.speaker) || { text: '', lastChange: 0, emittedText: '' };
       if (b.text !== st.text) { st.text = b.text; st.lastChange = now; }
       captionState.set(b.speaker, st);
@@ -1619,9 +1777,16 @@
       if (st.text && st.text !== st.emittedText && (now - st.lastChange) >= 1200) {
         const prev = st.emittedText || '';
         // A continuation extends what we last emitted for this speaker (same utterance still growing).
-        const isContinuation = prev && st.text.startsWith(prev);
+        // Once an utterance has been idle long enough that Meet would have torn its block down, treat
+        // the next text as a NEW utterance even if it happens to share a prefix — otherwise a recycled
+        // caption block makes two separate statements look like one growing line.
+        const stale = (now - st.lastChange) >= UTTERANCE_RESET_MS;
+        const isContinuation = prev && !stale && st.text.startsWith(prev);
         st.emittedText = st.text;
-        emitTranscriptLine(speaker, st.text, isContinuation);
+        // One-shot: tell the server the prior line was stored under the pre-resolution label.
+        const renamedFrom = st.renamedFrom || null;
+        delete st.renamedFrom;
+        emitTranscriptLine(speaker, st.text, isContinuation, renamedFrom);
       }
     }
     // Bound memory.
@@ -1634,16 +1799,20 @@
 
   // replace=true means this text supersedes the last line we emitted for this speaker (the caption
   // grew in place) — the recorder replaces that speaker's previous line rather than storing both.
-  function emitTranscriptLine(speaker, text, replace) {
+  function emitTranscriptLine(speaker, text, replace, prevSpeaker) {
     if (!text || text.length < 2) return;
-    if (!replace) {
-      // Only exact-dedup brand-new lines; replacements are expected to differ from prior text.
-      const key = `${speaker}::${text}`;
-      if (seenTranscriptKeys.has(key)) return;
-      seenTranscriptKeys.add(key);
-      if (seenTranscriptKeys.size > 1000) {
-        seenTranscriptKeys = new Set(Array.from(seenTranscriptKeys).slice(-500));
-      }
+
+    // Exact-dedup applies to REPLACEMENTS TOO. This guard used to be skipped when replace was true,
+    // on the reasoning that a replacement always differs from the prior text — but a re-scan of a
+    // still-mounted caption block re-emits byte-identical text with replace:true. That slipped past
+    // this check, and then past the server's supersede (another speaker's line had landed in the
+    // meantime), producing a verbatim duplicate. Identical text for the same speaker is never new
+    // speech, so drop it regardless of the flag.
+    const key = `${speaker}::${text}`;
+    if (seenTranscriptKeys.has(key)) return;
+    seenTranscriptKeys.add(key);
+    if (seenTranscriptKeys.size > 1000) {
+      seenTranscriptKeys = new Set(Array.from(seenTranscriptKeys).slice(-500));
     }
 
     console.log(`[GMR Content] Transcript${replace ? ' (revise)' : ''}: [${speaker}] ${text}`);
@@ -1652,6 +1821,7 @@
       speaker: speaker || 'Unknown',
       text,
       replace: !!replace,
+      prevSpeaker: prevSpeaker || null,
       timestamp: new Date().toISOString(),
       meetingId
     });

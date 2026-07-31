@@ -400,31 +400,48 @@ async function handleParticipantEvent(message, sendResponse) {
 }
 
 // Handle transcript line from content script
+// Meet's live captions GROW in place ("Hi" -> "Hi there" -> "Hi there, welcome"), so the content
+// script flags each growth step with replace:true meaning "supersede this speaker's last line".
+// This flag MUST be preserved end-to-end: dropping it made every partial append as its own line, so
+// transcript.json stored the same utterance repeatedly, each copy longer than the last.
 async function handleTranscriptLine(message, sendResponse) {
-  const { speaker, text, timestamp } = message;
-  
+  const { speaker, text, timestamp, replace, prevSpeaker } = message;
+
   const data = await chrome.storage.local.get(['transcriptLines', 'isRecording']);
   const transcriptLines = data.transcriptLines || [];
-  transcriptLines.push({ speaker, text, timestamp });
+  const last = transcriptLines[transcriptLines.length - 1];
+  // Same supersede rule as the server, so the popup preview matches what gets persisted.
+  // prevSpeaker covers the local user's label resolving from "You" to their real name mid-utterance.
+  // prevSpeaker only ever carries the local user's "You" -> real-name relabel; see server.js.
+  const sameSpeaker = last && (
+    last.speaker === speaker ||
+    (prevSpeaker && /^you$/i.test(prevSpeaker) && last.speaker === prevSpeaker)
+  );
+  if (replace && last && sameSpeaker &&
+      typeof text === 'string' && text.startsWith(last.text)) {
+    transcriptLines[transcriptLines.length - 1] = { speaker, text, timestamp };
+  } else {
+    transcriptLines.push({ speaker, text, timestamp });
+  }
   // Keep last 500 lines
   if (transcriptLines.length > 500) transcriptLines.shift();
-  
+
   await chrome.storage.local.set({ transcriptLines });
-  
+
   // Forward to popup
   await broadcastToPopups({
     type: 'TRANSCRIPT_UPDATE',
-    speaker, text, timestamp
+    speaker, text, timestamp, replace: !!replace, prevSpeaker: prevSpeaker || null
   });
-  
+
   // Forward to offscreen to send over WebSocket if recording
   if (data.isRecording) {
     await sendToOffscreen({
       type: 'SEND_TRANSCRIPT',
-      speaker, text, timestamp
+      speaker, text, timestamp, replace: !!replace, prevSpeaker: prevSpeaker || null
     });
   }
-  
+
   sendResponse({ success: true });
 }
 
