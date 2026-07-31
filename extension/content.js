@@ -929,6 +929,10 @@
     // are caught quickly, in addition to the steady RECONCILE_INTERVAL_MS heartbeat.
     participantObserver = new MutationObserver(() => scheduleReconcile());
     participantObserver.observe(document.body, { childList: true, subtree: true });
+
+    // Catch sudden tab / browser window closures or page teardowns instantly
+    window.addEventListener('beforeunload', markAllParticipantsLeft, { capture: true });
+    window.addEventListener('pagehide', markAllParticipantsLeft, { capture: true });
   }
 
   function scheduleReconcile() {
@@ -1133,7 +1137,11 @@
     for (const b of btns) {
       const l = (b.getAttribute('aria-label') || '').toLowerCase();
       if (/add people|add others|add to/.test(l)) continue;       // not the "add" button
-      if (/people|show everyone|participant|contributor/.test(l)) { b.click(); return; }
+      if (/people|show everyone|participant|contributor/.test(l)) {
+        if (b.getAttribute('aria-pressed') === 'true') return; // Panel is ALREADY open — do not click to close!
+        b.click();
+        return;
+      }
     }
   }
 
@@ -1158,19 +1166,50 @@
   // Is this [role="listitem"] a People-panel SECTION HEADER rather than a participant row?
   // Meet's panel is a flat list: headers ("1 joined", "0 also invited") sit as listitem siblings of
   // the real rows. Real rows always have an identity hook or interactive/avatar content.
+  // Is this list row something OTHER than a participant (a section header, or a stray control that
+  // Meet renders inside a list-like container)? Returning true means "not a person".
   function isPanelSectionHeader(item) {
     if (!item) return true;
+
     // Positive identity hook -> definitely a real participant row.
     if (item.hasAttribute('data-participant-id') || item.querySelector('[data-participant-id]')) {
       return false;
     }
-    // Real rows carry per-participant controls or an avatar image.
-    if (item.querySelector('button, [role="button"], img, [data-self-name]')) return false;
+
+    // A row that IS a button is a control, not a person. Presentation mode renders controls like
+    // "Open in new window", "Show my screen anyway" and "Enter full screen" as list items, and they
+    // used to pass the check below simply because they contain a button — so Meet's own toolbar
+    // self-certified as participants. Reject the control itself before looking for an avatar.
+    if (isControlRow(item)) return true;
+
+    // Real rows carry an AVATAR (or the self marker). Note this deliberately no longer accepts a
+    // bare <button>/[role=button] as proof of personhood — that was the loophole above.
+    if (item.querySelector('img, [data-self-name]')) return false;
+
     // No hooks at all: if the whole row reads as "<count> <status>", it's a header.
     const text = cleanName(item.textContent) || '';
     if (/^\d+\s+\S/.test(text)) return true;
     // Otherwise treat a hook-less row as a header only when it has no name-like text left.
     return !isPlausibleName(text);
+  }
+
+  // True when the row is itself an interactive control (or is entirely made of one). A participant
+  // row has text of its own outside its buttons — the person's name; a control does not.
+  function isControlRow(item) {
+    const tag = (item.tagName || '').toLowerCase();
+    const role = (item.getAttribute && item.getAttribute('role')) || '';
+    if (tag === 'button' || role === 'button' || role === 'menuitem' || role === 'tab') return true;
+
+    // Row text that comes ENTIRELY from inside buttons means there is no name in the row.
+    const rowText = (item.textContent || '').replace(/\s+/g, ' ').trim();
+    if (!rowText) return true;
+    const controls = item.querySelectorAll('button, [role="button"], [role="menuitem"]');
+    if (!controls.length) return false;
+    let controlText = '';
+    controls.forEach(c => { controlText += ' ' + (c.textContent || ''); });
+    controlText = controlText.replace(/\s+/g, ' ').trim();
+    // If stripping the buttons' text leaves nothing, the row was only a control.
+    return rowText.replace(controlText, '').replace(/\s+/g, ' ').trim().length === 0;
   }
 
   // Extract one participant's name from a People-panel row.
@@ -1211,9 +1250,25 @@
 
     const candidates = [];
     const pushCandidate = (t) => { const c = cleanName(t); if (c && isPlausibleName(c)) candidates.push(c); };
+
+    // Tile container or descendants might hold participant name in aria-label or title
+    if (el.getAttribute) {
+      pushCandidate(el.getAttribute('aria-label'));
+      pushCandidate(el.getAttribute('title'));
+    }
+
     if (el.querySelectorAll) {
+      el.querySelectorAll('[aria-label], [title]').forEach(node => {
+        pushCandidate(node.getAttribute('aria-label'));
+        pushCandidate(node.getAttribute('title'));
+      });
       el.querySelectorAll('*').forEach(node => {
-        if (node.children.length === 0) pushCandidate(node.textContent);
+        if (node.children.length !== 0) return;
+        // Skip text that lives inside a control. Presentation-mode buttons ("Show my screen anyway",
+        // "Enter full screen") are long phrases, and the longest-wins rule below would pick them over
+        // the actual name. A person's name is never rendered inside a button's own subtree.
+        if (node.closest && node.closest('button, [role="button"], [role="menuitem"], [role="tab"]')) return;
+        pushCandidate(node.textContent);
       });
     }
     if (candidates.length === 0) return null;
@@ -1234,17 +1289,22 @@
     if (!str) return null;
     let s = String(str).trim().replace(/\s+/g, ' ');
 
-    // Unwrap "<verb> <NAME> to/for ..." control tooltips -> "<NAME>".
-    let m = s.match(/^(?:pin|unpin|mute|remove|spotlight|highlight)\s+(.+?)\s+(?:to|from|for)\b/i);
+    // Unwrap "<verb> <NAME> to/from/for..." or "<verb> <NAME>" control tooltips -> "<NAME>".
+    let m = s.match(/^(?:pin|unpin|mute|remove|spotlight|highlight)\s+(.+?)(?:\s+(?:to|from|for)\b|$)/i);
     if (m) s = m[1].trim();
     // "More actions for Jane Doe", "More options for Jane Doe" -> "Jane Doe".
     m = s.match(/^more (?:actions|options) for\s+(.+)$/i);
     if (m) s = m[1].trim();
-    // "Jane Doe is presenting" / "Jane Doe presentation" -> "Jane Doe".
-    s = s.replace(/\s+is presenting$/i, '').trim();
+    // "Jane Doe is presenting" / "Jane Doe presentation" / "Jane Doe raised hand" -> "Jane Doe".
+    s = s.replace(/\s+(is presenting|raised hand|hand raised)$/i, '').trim();
     s = s.replace(/['']s presentation$/i, '').trim();
-    // Trailing role/self markers.
-    s = s.replace(/\s*\((you|host|co-host|meeting host|presenting)\)\s*$/i, '').trim();
+    // Trailing role/self/status markers (e.g. "(You)", "(Host, Muted)", "(Your presentation)", "(Hand raised)").
+    s = s.replace(/\s*\(([^)]+)\)\s*$/i, (match, inner) => {
+      if (/\b(you|host|co-host|meeting host|presenting|your presentation|presentation|your screen|screen|muted|unmuted|raised hand|hand raised)\b/i.test(inner)) {
+        return '';
+      }
+      return match;
+    }).trim();
 
     return s || null;
   }
@@ -1271,7 +1331,30 @@
     /backgrounds?[\s_-]*and[\s_-]*effects|visual[\s_-]*effects|apply[\s_-]*(a[\s_-]*)?(background|effect)/i,
     // Any snake_case / kebab-case token is a Meet internal identifier, never a display name.
     // Real names contain spaces or are single words; they never contain underscores.
-    /^[a-z0-9]+(?:[_-][a-z0-9]+)+$/i
+    /^[a-z0-9]+(?:[_-][a-z0-9]+)+$/i,
+    // PRESENTING-MODE UI. Screen sharing adds a batch of tooltips/promos that are structured like
+    // rows and were being stored as participants ("Try annotating (visible to everyone)",
+    // "You can't unmute someone else"). These are instructional SENTENCES, so match on sentence-like
+    // features rather than blanket-rejecting parentheses — real display names such as
+    // "Ravi Kumar (Finance)" legitimately contain them, and dropping a real person is worse than
+    // keeping a stray label.
+    /\b(can'?t|cannot|can not)\b/i,        // "You can't unmute someone else"
+    /^try\b/i,                             // "Try annotating ..."
+    /\bvisible to\b/i,                     // "... (visible to everyone)"
+    /\bannotat(e|ing|ion|ions)\b/i,        // annotation toolbar promos
+    /\byour (presentation|screen)\b/i,     // leftover presentation labels
+    /\b(is|are) sharing\b/i,               // "Someone is sharing their screen"
+    /\bstop sharing\b/i,
+    /\bpresent(ing)? to\b/i,                // "Presenting to everyone"
+    // Presentation-mode BUTTON labels. isPanelSectionHeader/isControlRow reject these structurally
+    // (they are controls, not people); these patterns are a text-level backstop for DOM shapes where
+    // the structural check cannot see the button — e.g. a label lifted from an aria-label.
+    // Verb-led imperative: "Open in new window", "Show my screen anyway", "Present now". Anchored to
+    // a leading verb so surnames that merely CONTAIN these words survive — "Addison Fullscreen" and
+    // "Sharon Windows" are plausible people, "Enter full screen" is not.
+    /^(open|show|enter|exit|close|start|stop|share|present|pin|unpin|mute|unmute|remove|add|invite|join|leave|turn|switch|view|hide)\b.*\b(window|screen|tab|anyway|everyone|call|people|now|here|mode|layout|others)\b/i,
+    /^(enter|exit) full ?screen\b/i,       // the fullscreen toggles specifically
+    /^open in\b/i                          // "Open in new window" / "Open in new tab"
   ];
 
   function isUiPhraseNoise(s) {

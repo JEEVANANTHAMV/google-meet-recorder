@@ -166,11 +166,10 @@ async function startRecording(serverUrl, mId, token, streamId, captureMic, email
     }
 
     // Handle capture end. If the user clicks Chrome's native "Stop sharing" button (screen/tab
-    // share) or the shared surface goes away, the video track ends WHILE we still think we're
-    // recording. That silently breaks the recording, so instead of quietly stopping we flag it as
-    // an interruption: the background worker raises a Chrome notification prompting the user to
-    // resume. A deliberate stop (meeting end / Stop button) sets `stoppingIntentionally` first, so
-    // this only fires for the unexpected "Stop sharing" case.
+    // share) or the shared surface goes away, the video track ends while we are still recording.
+    // handleCaptureInterrupted() keeps the recording alive on whatever tracks remain rather than
+    // tearing the session down. A deliberate stop (meeting end / Stop button) sets
+    // `stoppingIntentionally` first, so that path stops cleanly instead.
     attachCaptureEndHandler();
 
     // Create MediaRecorder
@@ -287,11 +286,6 @@ async function buildRecordingStream(capture, mic, isTabCapture) {
   }
 }
 
-// The shared surface went away unexpectedly (user clicked Chrome's "Stop sharing", or the shared
-// tab/window closed) while we still believed we were recording. Tear the local capture down but
-// ask the background worker to raise a notification so the user can resume — the recording is
-// otherwise silently broken. Transcript/participant capture (DOM-based, in the content script) is
-// untouched by this and keeps working.
 // The shared surface went away — "Stop sharing", window closed, tab gone.
 //
 // This must NOT tear down the recording. It used to call stopRecording(), which finalised the session

@@ -487,6 +487,13 @@ function handleJSONMessage(message, ws, session, remoteAddress) {
       break;
     case 'participant':
       if (!session) return;
+      // Deduplicate consecutive identical events for the same participant
+      const key = message.participantId || message.name;
+      const lastEv = [...session.participants].reverse().find(p => (p.participantId || p.name) === key);
+      if (lastEv && lastEv.event === message.event) {
+        logger.debug({ sessionId: session.id, name: message.name, event: message.event }, 'Ignored duplicate participant event');
+        return;
+      }
       session.participants.push({
         event: message.event,
         name: message.name,
