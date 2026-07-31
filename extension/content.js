@@ -806,17 +806,36 @@
   function checkMeetingEnded() {
     if (gmrState.isRecording) {
       const leaveBtn = document.querySelector('[aria-label*="leave" i], [aria-label*="salir" i], [jsname="b3F6wd"]');
-      
+
       const hasReturnHome = Array.from(document.querySelectorAll('button, a')).some(el => {
         const text = (el.textContent || '').toLowerCase();
         return text.includes('return to home') || text.includes('volver a la pantalla');
       });
-      
+
       if (hasReturnHome || !leaveBtn) {
         console.log('[GMR Content] Meeting end detected. Stopping recording...');
+        // When the HOST ends the call for everyone, Meet tears down instantly and nobody trips the
+        // grace-based leave detection — so every participant would be stored as "still in meeting".
+        // Emit a 'left' for everyone still present NOW so their leave time is captured.
+        markAllParticipantsLeft();
         chrome.runtime.sendMessage({ type: 'STOP_RECORDING' });
       }
     }
+  }
+
+  // Emit a 'left' event for every participant still in the call. Called on meeting-end (host ended
+  // for all) and when recording stops, so leave times aren't lost to an abrupt page teardown.
+  function markAllParticipantsLeft() {
+    const now = Date.now();
+    let changed = false;
+    for (const p of participantCache.values()) {
+      if (!p.leftAt) {
+        p.leftAt = now;
+        emitParticipantEvent('left', p.name, p.id);
+        changed = true;
+      }
+    }
+    if (changed) pushParticipantState(true);
   }
 
   // ==================== PARTICIPANT TRACKING (snapshot-diff engine) ====================
@@ -1008,12 +1027,46 @@
   }
 
   // Normalize a raw name string ("John Doe (You)", "  Jane  ") into a stable display name.
+  //
+  // Meet often exposes a name only INSIDE a control's tooltip/aria-label — e.g. a tile's pin button
+  // reads "Pin Adil Babakarkhel to your main screen", the more-actions button "More actions for
+  // Jane Doe". Grabbing that raw text stored junk names like "Pin X to your main screen" that never
+  // matched the roster, so the UI showed nobody. Unwrap those known patterns to the bare name before
+  // using it; genuinely non-name UI phrases are rejected by isPlausibleName.
   function cleanName(str) {
     if (!str) return null;
     let s = String(str).trim().replace(/\s+/g, ' ');
-    s = s.replace(/\s*\((you|host|co-host|meeting host|presenting)\)\s*$/i, '').trim();
+
+    // Unwrap "<verb> <NAME> to/for ..." control tooltips -> "<NAME>".
+    let m = s.match(/^(?:pin|unpin|mute|remove|spotlight|highlight)\s+(.+?)\s+(?:to|from|for)\b/i);
+    if (m) s = m[1].trim();
+    // "More actions for Jane Doe", "More options for Jane Doe" -> "Jane Doe".
+    m = s.match(/^more (?:actions|options) for\s+(.+)$/i);
+    if (m) s = m[1].trim();
+    // "Jane Doe is presenting" / "Jane Doe presentation" -> "Jane Doe".
+    s = s.replace(/\s+is presenting$/i, '').trim();
     s = s.replace(/['']s presentation$/i, '').trim();
+    // Trailing role/self markers.
+    s = s.replace(/\s*\((you|host|co-host|meeting host|presenting)\)\s*$/i, '').trim();
+
     return s || null;
+  }
+
+  // Phrases Meet renders that survive cleanName but are NOT participant names (warnings, buttons,
+  // summary strings, the recorder's own bot). Rejected wholesale so they never enter the roster.
+  const UI_PHRASE_NOISE = [
+    /\bto your main screen\b/i,          // leftover "... to your main screen" (unwrap missed it)
+    /\bmight still see\b/i,              // "Others might still see your full video."
+    /\bopen the (people|chat)\b/i,       // "Open the People panel"
+    /\band \d+ more$/i,                  // "Abhishek, Adil, amr and 5 more"
+    /^others\b/i,                        // "Others might..."
+    /notetaker|note taker|note-taker/i,  // the recorder bot itself
+    /\bpanel\b/i,                        // "...panel"
+    /\bfull video\b/i
+  ];
+
+  function isUiPhraseNoise(s) {
+    return UI_PHRASE_NOISE.some(re => re.test(s));
   }
 
   function isPlausibleName(str) {
@@ -1024,6 +1077,7 @@
     if (/https?:|google|meet\.google/i.test(s)) return false;
     if (!/[a-zÀ-ɏЀ-ӿ一-鿿]/i.test(s)) return false; // must contain a letter
     if (UI_NOISE.has(s.toLowerCase())) return false;
+    if (isUiPhraseNoise(s)) return false;              // multi-word Meet UI phrases / bot name
     return true;
   }
 
@@ -1483,12 +1537,23 @@
   }
 
   // Emit caption lines that have been stable for >= 1.2s (utterance finished).
+  //
+  // Google Meet live captions GROW in place: one utterance renders as "Hi" -> "Hi there" ->
+  // "Hi there, welcome". Naively emitting each stable state produced a new line per growth step, and
+  // since each was a longer string, exact-match dedup never caught them — a 3h class ballooned to
+  // multi-MB of overlapping text and broke summarisation. Fix: only emit the FINAL form of a growing
+  // utterance. While the caption for a speaker keeps extending the previously-emitted text (prefix
+  // match), we REPLACE that speaker's last line instead of appending; a genuinely new utterance
+  // (caption resets to text that is not a continuation) starts a fresh line.
   function flushStableCaptions() {
     const now = Date.now();
     for (const [speaker, st] of captionState) {
       if (st.text && st.text !== st.emittedText && (now - st.lastChange) >= 1200) {
+        const prev = st.emittedText || '';
+        // A continuation extends what we last emitted for this speaker (same utterance still growing).
+        const isContinuation = prev && st.text.startsWith(prev);
         st.emittedText = st.text;
-        emitTranscriptLine(speaker, st.text);
+        emitTranscriptLine(speaker, st.text, isContinuation);
       }
     }
     // Bound memory.
@@ -1499,20 +1564,26 @@
     }
   }
 
-  function emitTranscriptLine(speaker, text) {
+  // replace=true means this text supersedes the last line we emitted for this speaker (the caption
+  // grew in place) — the recorder replaces that speaker's previous line rather than storing both.
+  function emitTranscriptLine(speaker, text, replace) {
     if (!text || text.length < 2) return;
-    const key = `${speaker}::${text}`;
-    if (seenTranscriptKeys.has(key)) return;
-    seenTranscriptKeys.add(key);
-    if (seenTranscriptKeys.size > 1000) {
-      seenTranscriptKeys = new Set(Array.from(seenTranscriptKeys).slice(-500));
+    if (!replace) {
+      // Only exact-dedup brand-new lines; replacements are expected to differ from prior text.
+      const key = `${speaker}::${text}`;
+      if (seenTranscriptKeys.has(key)) return;
+      seenTranscriptKeys.add(key);
+      if (seenTranscriptKeys.size > 1000) {
+        seenTranscriptKeys = new Set(Array.from(seenTranscriptKeys).slice(-500));
+      }
     }
 
-    console.log(`[GMR Content] Transcript: [${speaker}] ${text}`);
+    console.log(`[GMR Content] Transcript${replace ? ' (revise)' : ''}: [${speaker}] ${text}`);
     chrome.runtime.sendMessage({
       type: 'TRANSCRIPT_LINE',
       speaker: speaker || 'Unknown',
       text,
+      replace: !!replace,
       timestamp: new Date().toISOString(),
       meetingId
     });

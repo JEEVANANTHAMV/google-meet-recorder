@@ -212,6 +212,28 @@ async function finalizeSession(session, reason) {
   await endRecordingStream(session);
 
   session.endedAt = session.endedAt || new Date().toISOString();
+
+  // Safety net for leave times: if the host ends the call for everyone, Meet tears the page down
+  // before the extension can emit per-person 'left' events, so participants would be stored as
+  // "still in meeting" forever. Synthesize a 'left' at session end for anyone still open in the
+  // event log. Idempotent — only fills gaps the extension didn't already report.
+  const stillIn = buildRoster(session.participants).filter(p => !p.leftAt);
+  for (const p of stillIn) {
+    session.participants.push({
+      event: 'left',
+      name: p.name,
+      participantId: p.id,
+      timestamp: session.endedAt,
+      receivedAt: session.endedAt,
+      synthetic: true,
+    });
+  }
+  if (stillIn.length) {
+    session.dirty.participants = true;
+    logger.info({ sessionId: session.id, count: stillIn.length },
+      'Synthesized leave events at session end (call ended for all)');
+  }
+
   session.state = session.recordingError ? 'error' : 'ended';
   session.dirty.meta = true;
   await flushSession(session, { force: true });
@@ -477,18 +499,30 @@ function handleJSONMessage(message, ws, session, remoteAddress) {
       scheduleFlush(session);
       logger.info({ sessionId: session.id, name: message.name, event: message.event }, 'Participant event');
       break;
-    case 'transcript':
+    case 'transcript': {
       if (!session) return;
-      session.transcript.push({
+      const line = {
         speaker: message.speaker,
         text: message.text,
         timestamp: message.timestamp,
         receivedAt: new Date().toISOString()
-      });
+      };
+      // Google Meet captions grow in place; the extension flags a continuation with replace:true so
+      // we supersede this speaker's previous line instead of appending every growth step (which used
+      // to bloat long transcripts to multiple MB and break summarisation). Guard: only replace when
+      // the last stored line is the same speaker AND the new text extends it (defensive prefix check).
+      const last = session.transcript[session.transcript.length - 1];
+      if (message.replace && last && last.speaker === line.speaker &&
+          typeof line.text === 'string' && line.text.startsWith(last.text)) {
+        session.transcript[session.transcript.length - 1] = line;
+      } else {
+        session.transcript.push(line);
+      }
       session.dirty.transcript = true;
       session.dirty.meta = true;
       scheduleFlush(session);
       break;
+    }
     case 'recording_end':
       if (session) finalizeAndNotify(session);
       break;
