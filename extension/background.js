@@ -186,6 +186,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         case 'CAPTURE_INTERRUPTED':
           await handleCaptureInterrupted(message, sendResponse);
           break;
+        case 'SURFACE_SWITCHED':
+          await handleSurfaceSwitched(message, sendResponse);
+          break;
         case 'AUTH_FAILED':
           await handleAuthFailed(message, sendResponse);
           break;
@@ -573,6 +576,33 @@ async function handleRecordingSaved(message, sendResponse) {
 // now broken, so raise a Chrome notification prompting the user to resume. Clicking the
 // notification (or its button) re-starts the recording via startRecordingAfterInterruption().
 const INTERRUPT_NOTIFICATION_ID = 'gmr-capture-interrupted';
+
+// The presenter used Chrome's "Change source" to share a different tab/window. The recording
+// continued uninterrupted (offscreen swapped the video track in place), so this is purely
+// informational — the important part is NOT raising the "recording interrupted" alarm, which is what
+// a source switch used to look like before surface switching was supported.
+async function handleSurfaceSwitched(message, sendResponse) {
+  console.log('[GMR] Shared surface switched, recording continues:', message.label || '(unnamed)');
+
+  // Clear any stale interruption state so the popup doesn't keep showing a resume prompt.
+  await chrome.storage.local.set({ recordingInterrupted: false });
+  try { chrome.notifications.clear(INTERRUPT_NOTIFICATION_ID); } catch (_) { /* ignore */ }
+
+  // Record it in the activity log using the same {event, name, timestamp} shape as participant events.
+  const data = await chrome.storage.local.get(['activityLog']);
+  const activityLog = data.activityLog || [];
+  activityLog.unshift({
+    event: 'surface_switched',
+    name: message.label || 'new source',
+    timestamp: new Date().toISOString()
+  });
+  if (activityLog.length > 100) activityLog.length = 100;
+  await chrome.storage.local.set({ activityLog });
+
+  await broadcastToPopups({ type: 'SURFACE_SWITCHED_POPUP', label: message.label || '' });
+
+  if (sendResponse) sendResponse({ success: true });
+}
 
 async function handleCaptureInterrupted(message, sendResponse) {
   const stored = await chrome.storage.local.get(['recordedTabId']);

@@ -575,16 +575,31 @@ function handleJSONMessage(message, ws, session, remoteAddress) {
 // ---------------------------------------------------------------------------
 // HTTP API
 // ---------------------------------------------------------------------------
-function sendJson(res, status, body) {
+function sendJson(res, status, body, filename) {
   const payload = JSON.stringify(body, null, 2);
-  res.writeHead(status, {
+  const headers = {
     'Content-Type': 'application/json',
     'Access-Control-Allow-Origin': CONFIG.corsOrigin,
     'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Api-Key',
     'Cache-Control': 'no-cache'
-  });
+  };
+  // When a filename is supplied the caller asked for ?download=1: force a file save instead of
+  // letting the browser render the JSON inline. Quoted to survive spaces; the name is built from
+  // sanitised ids by jsonFilename().
+  if (filename) {
+    headers['Content-Disposition'] = `attachment; filename="${filename}"`;
+  }
+  res.writeHead(status, headers);
   res.end(payload);
+}
+
+// Build a safe download filename like "transcript_qsg-difo-yhf_2026-07-31T13-30-48.json".
+// Strips anything outside [A-Za-z0-9._-] so a crafted id cannot inject header characters or path
+// separators into Content-Disposition.
+function jsonFilename(kind, meetingId, sessionId) {
+  const safe = (s) => String(s || '').replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 80);
+  return `${kind}_${safe(meetingId)}_${safe(sessionId)}.json`;
 }
 
 // Merge stored sessions with live in-memory sessions to build per-session descriptors.
@@ -787,20 +802,24 @@ async function handleApi(req, res, parsed) {
     if (sub === 'transcript') {
       const data = await readArtifact(meetingId, session.sessionId, 'transcript');
       const lines = (data && data.lines) || [];
-      return sendJson(res, 200, { meetingId, sessionId: session.sessionId, count: lines.length, lines });
+      const asFile = parsed.searchParams.get('download') === '1';
+      return sendJson(res, 200,
+        { meetingId, sessionId: session.sessionId, count: lines.length, lines },
+        asFile ? jsonFilename('transcript', meetingId, session.sessionId) : null);
     }
 
     if (sub === 'participants') {
       const data = await readArtifact(meetingId, session.sessionId, 'participants');
       const events = (data && data.events) || [];
       const roster = (data && data.roster) || buildRoster(events);
+      const asFile = parsed.searchParams.get('download') === '1';
       return sendJson(res, 200, {
         meetingId, sessionId: session.sessionId,
         eventCount: events.length,
         activeCount: roster.filter(r => !r.leftAt).length,
         totalCount: roster.length,
         events, roster
-      });
+      }, asFile ? jsonFilename('participants', meetingId, session.sessionId) : null);
     }
   }
 

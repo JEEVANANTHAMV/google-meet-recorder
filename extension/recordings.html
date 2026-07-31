@@ -157,6 +157,18 @@
       color: var(--color-black);
     }
 
+    /* Transcript / participants JSON downloads: secondary to the video download, so they stay
+       outlined rather than filled — the recording remains the primary action on each row. */
+    .btn-icon.data {
+      background: rgba(255, 255, 255, 0.05);
+      color: var(--color-white);
+    }
+
+    .btn-icon.data:hover {
+      background: var(--color-glass-bg-hover);
+      border-color: var(--color-border-hover);
+    }
+
     .btn-icon.delete {
       color: var(--color-red);
     }

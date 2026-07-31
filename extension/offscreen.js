@@ -122,10 +122,18 @@ async function startRecording(serverUrl, mId, token, streamId, captureMic, email
       // Fallback: screen/window/tab share. systemAudio:'include' asks Chrome to capture the
       // speaker/system audio for screen & window shares (supported on Windows/ChromeOS), and tab
       // shares include tab audio by default — so "entire screen" sharing still records the audio.
+      //
+      // surfaceSwitching:'include' makes Chrome show its native "Change source" button in the
+      // sharing bar. Without it (the default in an extension context is 'exclude') a presenter who
+      // picked the wrong tab/window — or who needs a different one for the next segment of a class —
+      // had NO way to switch: their only option was "Stop sharing", which ends the recording and
+      // splits one class across multiple sessions. See attachSurfaceSwitchHandler() for the track
+      // swap that keeps MediaRecorder encoding the NEW surface into the SAME recording.
       captureStream = await navigator.mediaDevices.getDisplayMedia({
         video: { width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 30 } },
         audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, sampleRate: 48000, channelCount: 2 },
-        systemAudio: 'include'
+        systemAudio: 'include',
+        surfaceSwitching: 'include'
       });
       console.log('[GMR Offscreen] Display media acquired (fallback). Audio tracks:', captureStream.getAudioTracks().length);
     }
@@ -171,15 +179,8 @@ async function startRecording(serverUrl, mId, token, streamId, captureMic, email
     // an interruption: the background worker raises a Chrome notification prompting the user to
     // resume. A deliberate stop (meeting end / Stop button) sets `stoppingIntentionally` first, so
     // this only fires for the unexpected "Stop sharing" case.
-    const vTrack = captureStream.getVideoTracks()[0];
-    if (vTrack) vTrack.onended = () => {
-      console.log('[GMR Offscreen] Capture ended (track onended)');
-      if (stoppingIntentionally) {
-        stopRecording();
-      } else {
-        handleCaptureInterrupted();
-      }
-    };
+    attachCaptureEndHandler();
+    attachSurfaceSwitchHandler();
 
     // Create MediaRecorder
     const mimeType = getSupportedMimeType();
@@ -304,6 +305,87 @@ function handleCaptureInterrupted() {
   console.warn('[GMR Offscreen] Capture interrupted (Stop sharing / surface closed)');
   chrome.runtime.sendMessage({ type: 'CAPTURE_INTERRUPTED', meetingId });
   stopRecording();
+}
+
+// ==================== SURFACE SWITCHING ("Change source") ====================
+//
+// With surfaceSwitching:'include', Chrome lets the presenter switch the shared tab/window mid-share.
+// Mechanically that is NOT a new stream: Chrome ends the current video track and adds a replacement
+// track to the SAME captureStream (an 'addtrack' event). Two things must be handled:
+//
+//  1. MediaRecorder is bound to `stream` and does not follow the swap on its own. We mutate `stream`
+//     in place — remove the dead video track, add the new one — so the recorder keeps encoding
+//     without being restarted. Restarting it would start a new file and split the class in two.
+//  2. The outgoing track fires onended, which normally means "Stop sharing" and triggers the
+//     interruption notification. During a switch that alarm is wrong, so we suppress it for a short
+//     window and re-arm the handler on the incoming track.
+
+let switchingSurface = false;   // true while a Change-source swap is in flight
+
+// (Re)bind the end-of-capture handler to the CURRENT video track. Called on start and after a swap,
+// since each new surface arrives as a fresh track with no handler attached.
+function attachCaptureEndHandler() {
+  const vTrack = captureStream && captureStream.getVideoTracks()[0];
+  if (!vTrack) return;
+  vTrack.onended = () => {
+    // A surface switch also ends the outgoing track — that is not an interruption.
+    if (switchingSurface) {
+      console.log('[GMR Offscreen] Old surface track ended as part of a source switch (ignored)');
+      return;
+    }
+    console.log('[GMR Offscreen] Capture ended (track onended)');
+    if (stoppingIntentionally) {
+      stopRecording();
+    } else {
+      handleCaptureInterrupted();
+    }
+  };
+}
+
+// Watch for Chrome handing us a replacement video track after the user picks a new source.
+function attachSurfaceSwitchHandler() {
+  if (!captureStream) return;
+  captureStream.addEventListener('addtrack', (event) => {
+    if (!event.track || event.track.kind !== 'video') return;
+    swapRecordedVideoTrack(event.track);
+  });
+}
+
+// Move a newly-shared surface into the live recording stream, keeping MediaRecorder running.
+function swapRecordedVideoTrack(newTrack) {
+  if (!stream || !newTrack) return;
+
+  // Suppress the interruption alarm while the outgoing track tears down. Cleared on a timer rather
+  // than inside onended because Chrome's ordering of addtrack vs. ended is not guaranteed.
+  switchingSurface = true;
+  setTimeout(() => { switchingSurface = false; }, 2000);
+
+  try {
+    const oldTracks = stream.getVideoTracks();
+    stream.addTrack(newTrack);
+    for (const t of oldTracks) {
+      stream.removeTrack(t);
+      // Release the old surface so Chrome drops its "sharing" indicator for it.
+      try { t.stop(); } catch (_) { /* already ended */ }
+    }
+
+    // The new track lives on captureStream; keep the end-of-capture handler pointed at it so a later
+    // "Stop sharing" is still detected.
+    attachCaptureEndHandler();
+
+    console.log('[GMR Offscreen] Switched recorded surface ->', newTrack.label,
+      '| recorder state:', mediaRecorder ? mediaRecorder.state : 'none');
+
+    // Tell the user the switch was captured, and that the recording was NOT interrupted.
+    chrome.runtime.sendMessage({
+      type: 'SURFACE_SWITCHED',
+      meetingId,
+      label: newTrack.label || ''
+    });
+  } catch (err) {
+    // A failed swap must not kill an in-progress recording; audio and prior video are still intact.
+    console.error('[GMR Offscreen] Failed to swap recorded surface:', err);
+  }
 }
 
 // Stop recording

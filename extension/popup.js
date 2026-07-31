@@ -474,6 +474,14 @@ function handleRuntimeMessage(message, sender, sendResponse) {
       renderRecordingCard();
       break;
     
+    case 'SURFACE_SWITCHED_POPUP':
+      // The presenter used Chrome's "Change source" to share a different tab/window. The recording
+      // continued through the swap, so clear any stale interruption error rather than leaving the
+      // "your recording is broken" message on screen.
+      state.recordingError = null;
+      renderRecordingCard();
+      break;
+
     case 'WS_STATUS_UPDATE':
       state.wsConnected = message.connected;
       state.wsLatency = message.latency || 0;

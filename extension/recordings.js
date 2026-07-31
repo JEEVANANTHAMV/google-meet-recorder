@@ -81,13 +81,38 @@ document.addEventListener('DOMContentLoaded', () => {
 
     for (const item of sortedHistory) {
       const formattedDate = new Date(item.timestamp).toLocaleString();
-      const downloadUrl = `${httpBaseUrl}/api/meetings/${item.meetingId}/recording?sessionId=${item.sessionId}&download=1`;
+      // Ids come from meeting URLs / server session ids, so encode them before interpolating.
+      const q = `sessionId=${encodeURIComponent(item.sessionId)}&download=1`;
+      const base = `${httpBaseUrl}/api/meetings/${encodeURIComponent(item.meetingId)}`;
+      const downloadUrl = `${base}/recording?${q}`;
+      const transcriptUrl = `${base}/transcript?${q}`;
+      const participantsUrl = `${base}/participants?${q}`;
 
       const downloadIcon = parseSVG(`
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
           <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
           <polyline points="7 10 12 15 17 10"/>
           <line x1="12" y1="15" x2="12" y2="3"/>
+        </svg>
+      `);
+
+      // Transcript: lines of text. Participants: people. Distinct shapes so the three download
+      // buttons are tellable apart at a glance rather than three identical arrows.
+      const transcriptIcon = parseSVG(`
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+          <polyline points="14 2 14 8 20 8"/>
+          <line x1="8" y1="13" x2="16" y2="13"/>
+          <line x1="8" y1="17" x2="13" y2="17"/>
+        </svg>
+      `);
+
+      const participantsIcon = parseSVG(`
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/>
+          <circle cx="9" cy="7" r="4"/>
+          <path d="M23 21v-2a4 4 0 0 0-3-3.87"/>
+          <path d="M16 3.13a4 4 0 0 1 0 7.75"/>
         </svg>
       `);
 
@@ -112,14 +137,39 @@ document.addEventListener('DOMContentLoaded', () => {
         // Actions
         createDOMElement('td', { style: 'text-align: right;' }, [
           createDOMElement('div', { className: 'btn-actions' }, [
-            // Download button
+            // Download the recorded video
             createDOMElement('a', {
               className: 'btn-icon download',
               href: downloadUrl,
-              target: '_blank'
+              target: '_blank',
+              title: 'Download the recorded video (.webm)'
             }, [
               downloadIcon,
-              'Download'
+              'Video'
+            ]),
+            // Download transcript.json. `download` on the anchor is a hint only — these are
+            // cross-origin URLs, so the server's Content-Disposition (?download=1) is what actually
+            // makes the browser save the file instead of rendering the JSON in a tab.
+            createDOMElement('a', {
+              className: 'btn-icon data',
+              href: transcriptUrl,
+              target: '_blank',
+              download: '',
+              title: 'Download the transcript as JSON'
+            }, [
+              transcriptIcon,
+              'Transcript'
+            ]),
+            // Download participants.json (join/leave events + roster)
+            createDOMElement('a', {
+              className: 'btn-icon data',
+              href: participantsUrl,
+              target: '_blank',
+              download: '',
+              title: 'Download the participants list as JSON'
+            }, [
+              participantsIcon,
+              'Participants'
             ]),
             // Delete button
             createDOMElement('button', {
