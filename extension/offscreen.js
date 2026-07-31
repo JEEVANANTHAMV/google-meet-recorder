@@ -46,6 +46,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           resumeRecording();
           sendResponse({ success: true });
           break;
+        case 'MIC_MUTE_STATE':
+          setMicMuted(message.muted);
+          sendResponse({ success: true });
+          break;
         case 'SEND_PARTICIPANT':
           sendJSONMessage({
             type: 'participant',
@@ -355,6 +359,25 @@ function resumeRecording() {
       type: 'RECORDING_STATUS',
       status: 'recording'
     });
+  }
+}
+
+// Follow Google Meet's mic mute state for the LOCAL microphone only (privacy). Toggling the mic
+// track's `enabled` makes it emit silence into the recorded mix while muted, without tearing down
+// the stream — so unmuting resumes cleanly. The meeting (tab) audio is never touched, so other
+// participants are always recorded. No-op when mic capture wasn't enabled (no micStream).
+function setMicMuted(muted) {
+  if (!micStream) return;
+  const tracks = micStream.getAudioTracks();
+  if (!tracks.length) return;
+  const enabled = !muted;
+  let changed = false;
+  for (const t of tracks) {
+    if (t.enabled !== enabled) { t.enabled = enabled; changed = true; }
+  }
+  if (changed) {
+    console.log(`[GMR Offscreen] Local mic ${muted ? 'MUTED (not recorded)' : 'UNMUTED (recording)'} — following Meet`);
+    chrome.runtime.sendMessage({ type: 'RECORDING_STATUS', status: 'recording', micMuted: !!muted });
   }
 }
 

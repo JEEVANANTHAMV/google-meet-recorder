@@ -20,6 +20,9 @@
   let lastSentTotalCount = null;
   let wasInCall = false;
   let lastReportedInMeeting = null;
+  let lastReportedMicMuted = null;   // last Meet mic-mute state pushed to the recorder
+  let micMuteObserver = null;        // watches the mic button for instant mute/unmute reaction
+  let micMuteDebounce = null;
   let captionsArmed = false;          // true once we've successfully enabled captions at least once
   let captionWarnCooldownUntil = 0;   // suppress duplicate "captions required" warnings
   let lastPanelOpenAttempt = 0;       // rate-limit auto-opening the People panel
@@ -148,7 +151,10 @@
     
     // Setup transcript capture observers
     setupTranscriptCapture();
-    
+
+    // Setup near-instant mic mute/unmute following (privacy).
+    setupMicMuteObserver();
+
     // Listen for messages from popup/background
     chrome.runtime.onMessage.addListener(handleMessage);
     
@@ -163,6 +169,7 @@
       checkMeetingEnded();
       maybeAutoRecord();
       updateReminders();
+      syncMicMuteState();
     }, RECONCILE_INTERVAL_MS);
 
     // Run one reconcile pass immediately so we don't wait for the first interval tick.
@@ -662,6 +669,9 @@
         for (const [key, value] of Object.entries(changes)) {
           updated[key] = value.newValue;
         }
+        // On a recording start/stop transition, force a fresh mic-mute push next tick so the mic
+        // immediately reflects Meet's current state (e.g. faculty who start already muted).
+        if ('isRecording' in changes) lastReportedMicMuted = null;
         gmrState = { ...gmrState, ...updated };
         updatePanelUI(gmrState);
       }
@@ -821,6 +831,64 @@
         chrome.runtime.sendMessage({ type: 'STOP_RECORDING' });
       }
     }
+  }
+
+  // ==================== MIC MUTE FOLLOWING ====================
+  // Privacy: the faculty's own microphone (when "Enable my mic" is on) is captured by a browser
+  // getUserMedia stream that is INDEPENDENT of Google Meet — so muting yourself in Meet would NOT
+  // stop your voice from being recorded. To honour the expectation "muted in Meet => not recorded",
+  // we read Meet's mic button state from the DOM and tell the recorder to gate the mic track: it is
+  // silenced while Meet shows muted and resumes when unmuted. Only the local mic is affected; the
+  // meeting (other-participant) audio is unchanged.
+  //
+  // Meet's toolbar mic toggle: aria-label reads "Turn off microphone" when you are LIVE (unmuted),
+  // and "Turn on microphone" when you are MUTED. data-is-muted="true" is also present on newer DOM.
+  function readMicMuted() {
+    // Prefer the explicit muted-state attribute when present.
+    const stateEl = document.querySelector('[data-is-muted]');
+    if (stateEl) {
+      const v = stateEl.getAttribute('data-is-muted');
+      if (v === 'true') return true;
+      if (v === 'false') return false;
+    }
+    // Fall back to the toolbar button's aria-label.
+    const turnOn = document.querySelector(
+      'button[aria-label*="turn on microphone" i], button[aria-label*="activar micrófono" i]'
+    );
+    if (turnOn) return true;   // "Turn ON microphone" is offered => currently muted
+    const turnOff = document.querySelector(
+      'button[aria-label*="turn off microphone" i], button[aria-label*="desactivar micrófono" i]'
+    );
+    if (turnOff) return false; // "Turn OFF microphone" is offered => currently live
+    return null;               // unknown (button not found) — don't change state
+  }
+
+  function syncMicMuteState() {
+    if (!gmrState.isRecording) return;   // nothing to gate unless we're recording
+    const muted = readMicMuted();
+    if (muted === null || muted === lastReportedMicMuted) return;
+    lastReportedMicMuted = muted;
+    console.log(`[GMR Content] Meet mic ${muted ? 'MUTED — pausing mic recording' : 'UNMUTED — resuming mic recording'}`);
+    chrome.runtime.sendMessage({ type: 'MIC_MUTE_STATE', muted, meetingId });
+  }
+
+  // Near-instant mute following: watch the mic toolbar button for attribute flips (aria-label /
+  // data-is-muted change the moment the user toggles) so we react immediately rather than waiting
+  // for the next reconcile tick. The interval-based syncMicMuteState() remains as a safety backstop
+  // (covers the button being re-rendered / not yet present at init).
+  function setupMicMuteObserver() {
+    if (micMuteObserver) micMuteObserver.disconnect();
+    // Observe broadly but cheaply: only attribute changes to aria-label / data-is-muted anywhere in
+    // the toolbar trigger our (debounced) check. Meet re-renders the button, so we watch document.
+    micMuteObserver = new MutationObserver(() => {
+      if (micMuteDebounce) return;
+      micMuteDebounce = setTimeout(() => { micMuteDebounce = null; syncMicMuteState(); }, 60);
+    });
+    micMuteObserver.observe(document, {
+      subtree: true,
+      attributes: true,
+      attributeFilter: ['aria-label', 'data-is-muted']
+    });
   }
 
   // Emit a 'left' event for every participant still in the call. Called on meeting-end (host ended

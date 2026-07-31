@@ -129,6 +129,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         case 'RESUME_RECORDING':
           await sendToOffscreen({ type: 'RESUME_RECORDING' }, sendResponse);
           break;
+        case 'MIC_MUTE_STATE':
+          // Faculty muted/unmuted themselves in Google Meet — gate the local mic track in the
+          // recorder so a muted mic is not recorded (privacy). No-op if mic capture isn't enabled.
+          await sendToOffscreen({ type: 'MIC_MUTE_STATE', muted: message.muted }, sendResponse);
+          break;
         case 'GET_STATE':
           await handleGetState(sendResponse);
           break;
