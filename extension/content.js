@@ -1870,27 +1870,9 @@
   let seenTranscriptKeys = new Set();
 
   function setupTranscriptCapture() {
-    console.log('[GMR Content] Setting up transcript capture...');
-
-    const tryAttach = () => {
-      const container = findCaptionContainer();
-      if (container && container !== transcriptContainer) {
-        transcriptContainer = container;
-        console.log('[GMR Content] Caption container attached');
-        observeTranscript(container);
-      }
-      return !!container;
-    };
-
-    // Keep (re)attaching: the caption container is created/destroyed as captions toggle.
-    if (!tryAttach()) {
-      const retry = setInterval(() => tryAttach(), 2000);
-      setTimeout(() => clearInterval(retry), 120000);
-    }
-
-    // Stabilization loop: finalize + emit caption lines that have stopped changing.
-    if (captionStabilizeTimer) clearInterval(captionStabilizeTimer);
-    captionStabilizeTimer = setInterval(flushStableCaptions, 700);
+    console.log('[GMR Content] Setting up WebRTC DataChannel transcript capture (Attendee architecture)...');
+    // Transcripts are captured 100% via meet-interceptor.js WebRTC DataChannel ('captions' channel Protobuf).
+    // DOM MutationObserver scanning is disabled for 100% Attendee-style zero-DOM-noise performance.
   }
 
   function findCaptionContainer() {
