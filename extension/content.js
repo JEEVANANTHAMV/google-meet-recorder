@@ -1333,30 +1333,53 @@
     // Real names contain spaces or are single words; they never contain underscores.
     /^[a-z0-9]+(?:[_-][a-z0-9]+)+$/i,
     // PRESENTING-MODE UI. Screen sharing adds a batch of tooltips/promos that are structured like
-    // rows and were being stored as participants ("Try annotating (visible to everyone)",
-    // "You can't unmute someone else"). These are instructional SENTENCES, so match on sentence-like
-    // features rather than blanket-rejecting parentheses — real display names such as
-    // "Ravi Kumar (Finance)" legitimately contain them, and dropping a real person is worse than
-    // keeping a stray label.
+    // rows and were being stored as participants.
     /\b(can'?t|cannot|can not)\b/i,        // "You can't unmute someone else"
     /^try\b/i,                             // "Try annotating ..."
     /\bvisible to\b/i,                     // "... (visible to everyone)"
     /\bannotat(e|ing|ion|ions)\b/i,        // annotation toolbar promos
     /\byour (presentation|screen)\b/i,     // leftover presentation labels
-    /\b(is|are) sharing\b/i,               // "Someone is sharing their screen"
+    /\b(is|are) (sharing|presenting)\b/i,  // "Someone is sharing" / "You are presenting"
+    /^you are\b/i,                         // "You are presenting", "You are the host", etc.
     /\bstop sharing\b/i,
-    /\bpresent(ing)? to\b/i,                // "Presenting to everyone"
-    // Presentation-mode BUTTON labels. isPanelSectionHeader/isControlRow reject these structurally
-    // (they are controls, not people); these patterns are a text-level backstop for DOM shapes where
-    // the structural check cannot see the button — e.g. a label lifted from an aria-label.
-    // Verb-led imperative: "Open in new window", "Show my screen anyway", "Present now". Anchored to
-    // a leading verb so surnames that merely CONTAIN these words survive — "Addison Fullscreen" and
-    // "Sharon Windows" are plausible people, "Enter full screen" is not.
+    /\bpresent(ing)? to\b/i,               // "Presenting to everyone"
+    // ── Host / moderator control labels ─────────────────────────────────────────
+    /^(make|remove as|allow|ask|admit|deny|block)\b/i,  // "Make moderator", "Allow to unmute", etc.
+    /\b(make|remove as) (moderator|host|co-host)\b/i,
+    /\b(allow|ask) (to )?(unmute|mute|speak)\b/i,
+    /^ask to mute\b/i,                     // "Ask to mute all"
+    /^admit\b/i,                           // "Admit" (waiting room button)
+    /\bremove from (call|meeting)\b/i,
+    /^lower (your |everyone'?s? )?hand\b/i, // "Lower your hand" / "Lower everyone's hand"
+    /^raise your hand\b/i,
+    // ── Recording / streaming banners ────────────────────────────────────────────
+    /\b(you are|this call is) recording\b/i,
+    /\brecording (started|stopped|paused|resumed)\b/i,
+    /\blive stream (is|has)\b/i,
+    /\bstreaming to\b/i,
+    // ── Waiting room / lobby states ──────────────────────────────────────────────
+    /^(asking|waiting) to (join|be admitted)\b/i,
+    /^you (left|have left)\b/i,            // "You left the call"
+    /^return to home\b/i,
+    /^getting ready\b/i,
+    /^join now\b/i,
+    // ── Annotation / drawing toolbar item names ──────────────────────────────────
+    /disappearing ink/i,                   // Meet annotation erase-mode label
+    /\bwhiteboard\b/i,
+    /\bdraw(ing)?\s+(tool|mode)\b/i,
+    /^(pen|eraser|laser pointer|pointer|selector|text tool|highlighter)$/i, // annotation tool names
+    /^(thin|medium|thick|small|large)$/i,  // annotation stroke size labels (single-word)
+    /^(undo|redo|clear all)$/i,            // annotation action buttons
+    // ── Breakout room labels ─────────────────────────────────────────────────────
+    /^breakout room\b/i,
+    /^move to\b/i,                         // "Move to breakout room"
+    // ── Poll / Q&A panel strings ─────────────────────────────────────────────────
+    /\b(poll results|your question|end poll|submit response)\b/i,
+    // ── Presentation-mode BUTTON labels ─────────────────────────────────────────
     /^(open|show|enter|exit|close|start|stop|share|present|pin|unpin|mute|unmute|remove|add|invite|join|leave|turn|switch|view|hide)\b.*\b(window|screen|tab|anyway|everyone|call|people|now|here|mode|layout|others)\b/i,
-    /^(enter|exit) full ?screen\b/i,       // the fullscreen toggles specifically
-    /^open in\b/i,                         // "Open in new window" / "Open in new tab"
-    // Mic/camera toolbar button labels: "Unmute your microphone", "Turn on your camera",
-    // "Turn off your video". Any verb + "your" + device/action word is always a toolbar label.
+    /^(enter|exit) full ?screen\b/i,
+    /^open in\b/i,
+    // ── Mic/camera toolbar button labels ────────────────────────────────────────
     /^(mute|unmute|turn on|turn off|enable|disable|use)\b.+\b(microphone|camera|video|audio|speaker|mic)\b/i,
     /\b(microphone|your camera|your video|your mic|your audio)\b/i
   ];

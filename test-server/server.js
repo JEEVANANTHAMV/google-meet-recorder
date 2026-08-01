@@ -110,29 +110,48 @@ function distinctParticipantCount(events) {
 }
 
 // Replay the participant event log into a current roster (who is in / who left).
-// Each distinct join/leave window is tracked separately; the roster entry for a person
-// shows their EARLIEST joinedAt and their LATEST leftAt so the full attendance span is
-// visible, and the events array carries every individual segment for detailed analysis.
+//
+// One roster ROW per distinct attendance window. If a participant leaves and rejoins,
+// each join/leave cycle becomes its own row (session index appended to the key when > 1)
+// so every attendance window is visible, not just the first join → last left span.
+//
+// Example — Poonthamil joined twice:
+//   { id: "poonthamil jeeva",   joinedAt: "04:26:01Z", leftAt: "04:26:31Z" }
+//   { id: "poonthamil jeeva#2", joinedAt: "04:26:53Z", leftAt: "04:27:01Z" }
 function buildRoster(events) {
-  const map = new Map();
+  // sessionCount tracks how many times each participant has joined so far.
+  const sessionCount = new Map();
+  // active holds the CURRENT open session for a participant (leftAt still null).
+  const active = new Map();
+  const rows = [];
+
   for (const e of events) {
-    const key = e.participantId || e.name;
-    if (!key) continue;
+    const baseKey = e.participantId || e.name;
+    if (!baseKey) continue;
+
     if (e.event === 'joined') {
-      const existing = map.get(key);
-      if (!existing) {
-        // First time seen: create the entry with original joinedAt
-        map.set(key, { id: e.participantId || null, name: e.name, joinedAt: e.timestamp, leftAt: null });
-      } else if (existing.leftAt) {
-        // Rejoin after leave: preserve the EARLIEST joinedAt, clear leftAt (back in call)
-        map.set(key, { id: e.participantId || null, name: e.name, joinedAt: existing.joinedAt, leftAt: null });
+      if (active.has(baseKey)) {
+        // Already tracked as in-call (duplicate joined) — skip.
+        continue;
       }
-      // If leftAt is null, they never left — duplicate joined event; skip (server dedup handles this)
-    } else if (e.event === 'left' && map.has(key)) {
-      map.get(key).leftAt = e.timestamp;
+      const count = (sessionCount.get(baseKey) || 0) + 1;
+      sessionCount.set(baseKey, count);
+      // First session uses the bare id; subsequent ones get "#2", "#3", … so each is a distinct row.
+      const rowKey = count === 1 ? baseKey : `${baseKey}#${count}`;
+      const row = { id: e.participantId || null, name: e.name, joinedAt: e.timestamp, leftAt: null };
+      active.set(baseKey, row);
+      rows.push(row);
+
+    } else if (e.event === 'left') {
+      const row = active.get(baseKey);
+      if (row) {
+        row.leftAt = e.timestamp;
+        active.delete(baseKey);
+      }
     }
   }
-  return Array.from(map.values());
+
+  return rows;
 }
 
 function metaFromSession(session) {
