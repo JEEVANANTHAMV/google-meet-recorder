@@ -208,10 +208,13 @@
       // Skip screen share devices (parentDeviceId indicates a secondary screen share stream)
       if (u.parentDeviceId) continue;
 
+      // If status is explicit 6 (not in meeting) or 7 (removed), mark not_in_meeting.
+      // Otherwise, any user present in the protobuf stream is active (in_meeting).
+      const isLeaving = u.status === 6 || u.status === 7;
       const userObj = {
         deviceId: u.deviceId,
         fullName: u.fullName || u.displayName || 'Unknown',
-        status: u.status === 1 ? 'in_meeting' : (u.status === 6 ? 'not_in_meeting' : 'unknown'),
+        status: isLeaving ? 'not_in_meeting' : 'in_meeting',
         isHost: !!u.isHost
       };
 
@@ -229,27 +232,14 @@
     }
   }
 
-  async function decompressDeflate(data) {
+  function decompressData(data) {
+    if (!data || data.length < 2) return data;
     try {
-      if (typeof DecompressionStream !== 'undefined') {
-        const ds = new DecompressionStream('deflate-raw');
-        const writer = ds.writable.getWriter();
-        writer.write(data);
-        writer.close();
-        const buffer = await new Response(ds.readable).arrayBuffer();
-        return new Uint8Array(buffer);
+      if (typeof pako !== 'undefined' && typeof pako.inflate === 'function') {
+        return pako.inflate(data);
       }
-    } catch (e) {
-      try {
-        const ds = new DecompressionStream('deflate');
-        const writer = ds.writable.getWriter();
-        writer.write(data);
-        writer.close();
-        const buffer = await new Response(ds.readable).arrayBuffer();
-        return new Uint8Array(buffer);
-      } catch (err) {}
-    }
-    return data; // fallback uncompressed
+    } catch (e) {}
+    return data;
   }
 
   // ==================== FETCH INTERCEPTOR ====================
@@ -303,10 +293,10 @@
     console.log('[MeetInterceptor] Intercepted DataChannel:', channel.label);
 
     if (channel.label === 'collections') {
-      channel.addEventListener('message', async event => {
+      channel.addEventListener('message', event => {
         try {
           const raw = new Uint8Array(event.data);
-          const decompressed = await decompressDeflate(raw);
+          const decompressed = decompressData(raw);
           const collectionEvent = messageDecoders['CollectionEvent'](decompressed);
           const list = collectionEvent.body?.userInfoListWrapperAndChatWrapperWrapper?.userInfoListWrapperAndChatWrapper?.userInfoListWrapper?.userInfoList || [];
           emitUsersUpdate(list);

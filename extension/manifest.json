@@ -34,7 +34,7 @@
   "content_scripts": [
     {
       "matches": ["https://meet.google.com/*"],
-      "js": ["meet-interceptor.js"],
+      "js": ["pako.min.js", "meet-interceptor.js"],
       "run_at": "document_start",
       "world": "MAIN",
       "all_frames": false
@@ -65,7 +65,7 @@
   },
   "web_accessible_resources": [
     {
-      "resources": ["offscreen.html", "offscreen.js", "meet-interceptor.js"],
+      "resources": ["offscreen.html", "offscreen.js", "pako.min.js", "meet-interceptor.js"],
       "matches": ["<all_urls>"]
     }
   ]

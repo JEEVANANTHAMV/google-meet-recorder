@@ -85,7 +85,8 @@
     'turn off', 'turn on', 'add people', 'search for people', 'contributors', 'in this call',
     // words that come from data-participant-id paths ("spaces/<id>/devices/<n>") or panel status
     'devices', 'spaces', 'device', 'space', 'guest', 'anonymous', 'calling', 'ringing',
-    'invited', 'waiting', 'joining', 'presentation', 'your presentation', 'meeting details'
+    'invited', 'waiting', 'joining', 'presentation', 'your presentation', 'meeting details',
+    'just you', 'colours', 'colors'
   ]);
 
   // ==================== DOM CREATION HELPER ====================
@@ -955,27 +956,37 @@
         if (!normName || !isPlausibleName(normName)) continue;
         const id = normName.toLowerCase();
 
-        const existing = participantCache.get(id);
-        if (!existing) {
-          participantCache.set(id, {
-            id: id,
-            name: normName,
-            joinedAt: now,
-            lastSeen: now,
-            leftAt: null,
-            missingSince: null
-          });
-          changed = true;
-          console.log('[GMR Content] Participant JOIN (WebRTC Protobuf):', normName);
-          emitParticipantEvent('joined', normName, id);
-        } else {
-          existing.lastSeen = now;
-          existing.missingSince = null;
-          if (existing.leftAt) {
-            existing.leftAt = null;
+        if (u.status === 'in_meeting') {
+          const existing = participantCache.get(id);
+          if (!existing) {
+            participantCache.set(id, {
+              id: id,
+              name: normName,
+              joinedAt: now,
+              lastSeen: now,
+              leftAt: null,
+              missingSince: null
+            });
             changed = true;
-            console.log('[GMR Content] Participant REJOIN (WebRTC Protobuf):', normName);
+            console.log('[GMR Content] Participant JOIN (WebRTC Protobuf):', normName);
             emitParticipantEvent('joined', normName, id);
+          } else {
+            existing.lastSeen = now;
+            existing.missingSince = null;
+            if (existing.leftAt) {
+              existing.leftAt = null;
+              changed = true;
+              console.log('[GMR Content] Participant REJOIN (WebRTC Protobuf):', normName);
+              emitParticipantEvent('joined', normName, id);
+            }
+          }
+        } else if (u.status === 'not_in_meeting') {
+          const existing = participantCache.get(id);
+          if (existing && !existing.leftAt) {
+            existing.leftAt = now;
+            changed = true;
+            console.log('[GMR Content] Participant LEFT (WebRTC Protobuf):', normName);
+            emitParticipantEvent('left', normName, id);
           }
         }
       }
@@ -1082,21 +1093,14 @@
       if (!found.has(norm)) found.set(norm, disp);
     };
 
-    // WEBRTC PROTOBUF SOURCE (highest precision): Include users known from DataChannels/RPCs
+    // WEBRTC PROTOBUF SOURCE (100% pure Attendee architecture):
+    // Only include users received directly from WebRTC DataChannels / Protobuf RPCs.
+    // DOM text scraping (readPeoplePanel / video tile text extraction) is disabled to eliminate
+    // UI chrome noise (buttons, color palette labels, status badges) completely.
     for (const u of interceptorUsersByDeviceId.values()) {
       if (u.status === 'in_meeting' && u.fullName) {
         addName(u.fullName);
       }
-    }
-
-    // PRIMARY: the People panel lists each participant exactly once, with their real name.
-    const panelNames = readPeoplePanel();
-    if (panelNames && panelNames.length) {
-      panelNames.forEach(addName);
-    } else {
-      // FALLBACK (panel not open/readable): derive names from video tiles. Less reliable, so we
-      // try hard to extract a real name and skip tiles we can't name confidently.
-      document.querySelectorAll('[data-participant-id]').forEach(el => addName(extractNameFromContainer(el)));
     }
 
     // ALWAYS include the local user.
@@ -1464,6 +1468,8 @@
     /^(undo|redo|clear all)$/i,            // annotation action buttons
     /\b(colou?r)\s+(green|red|blue|yellow|black|white|orange|purple|pink|gray|grey|brown)\b/i, // annotation color picker labels
     /^(stickers?|emojis?|reactions?|stamps?)$/i, // annotation & reaction toolbar labels
+    /^just\s+you$/i,                       // Meet status badge "Just you"
+    /^colou?rs?$/i,                        // Annotation palette tab title
     // ── Breakout room labels ─────────────────────────────────────────────────────
     /^breakout room\b/i,
     /^move to\b/i,                         // "Move to breakout room"
@@ -2086,6 +2092,7 @@
   // grew in place) — the recorder replaces that speaker's previous line rather than storing both.
   function emitTranscriptLine(speaker, text, replace, prevSpeaker) {
     if (!text || text.length < 2) return;
+    if (/arrow_downward|jump to the bottom/i.test(text)) return; // reject floating navigation buttons in captions container
 
     // Exact-dedup applies to REPLACEMENTS TOO. This guard used to be skipped when replace was true,
     // on the reasoning that a replacement always differs from the prior text — but a re-scan of a
