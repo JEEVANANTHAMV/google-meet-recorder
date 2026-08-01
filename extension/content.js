@@ -1364,11 +1364,17 @@
     /^getting ready\b/i,
     /^join now\b/i,
     // ── Annotation / drawing toolbar item names ──────────────────────────────────
-    /disappearing ink/i,                   // Meet annotation erase-mode label
+    // Google Meet annotation toolbar items: Pen, Eraser, Laser pointer, Disappearing ink,
+    // Lines and shapes, Text tool, Selector, Highlighter — plus stroke sizes and actions.
+    // Pattern covers all known names; also catches future additions that contain "ink",
+    // "shapes", "draw", "eraser", "pointer", or "tool".
+    /disappearing ink/i,
+    /lines and shapes/i,                   // Meet annotation shape tool
     /\bwhiteboard\b/i,
     /\bdraw(ing)?\s+(tool|mode)\b/i,
-    /^(pen|eraser|laser pointer|pointer|selector|text tool|highlighter)$/i, // annotation tool names
-    /^(thin|medium|thick|small|large)$/i,  // annotation stroke size labels (single-word)
+    /^(pen|eraser|laser pointer|pointer|selector|text tool|highlighter|stamp|spotlight)$/i,
+    /\b(and shapes|ink tool|annotation tool)\b/i, // generic catch-all for future toolbar items
+    /^(thin|medium|thick|small|large)$/i,  // annotation stroke size labels
     /^(undo|redo|clear all)$/i,            // annotation action buttons
     // ── Breakout room labels ─────────────────────────────────────────────────────
     /^breakout room\b/i,

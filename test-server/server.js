@@ -532,7 +532,9 @@ function handleJSONMessage(message, ws, session, remoteAddress) {
         /^you are\b/i,               // "You are presenting", "You are the host"
         /\b(is|are) (sharing|presenting)\b/i,
         /disappearing ink/i,
-        /^(pen|eraser|laser pointer|pointer|selector|text tool|highlighter)$/i,
+        /lines and shapes/i,               // Meet annotation shape tool
+        /\b(and shapes|ink tool|annotation tool)\b/i,
+        /^(pen|eraser|laser pointer|pointer|selector|text tool|highlighter|stamp|spotlight)$/i,
         /^(undo|redo|clear all)$/i,
         /^(thin|medium|thick|small|large)$/i,
         /^breakout room\b/i,
