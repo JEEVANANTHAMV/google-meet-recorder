@@ -58,7 +58,7 @@
   },
   "web_accessible_resources": [
     {
-      "resources": ["offscreen.html", "offscreen.js"],
+      "resources": ["offscreen.html", "offscreen.js", "meet-interceptor.js"],
       "matches": ["<all_urls>"]
     }
   ]

@@ -922,8 +922,87 @@
   //  3. Active count is ALWAYS derived from the cache (entries with leftAt === null), so it can
   //     never drift the way an increment/decrement counter does.
   //  4. Everything is gated on isInCall() so nothing is reported from the lobby / home screen.
+  // ==================== MAIN WORLD INTERCEPTOR INJECTION ====================
+  function injectMeetInterceptor() {
+    if (document.getElementById('gmr-meet-interceptor')) return;
+    try {
+      const s = document.createElement('script');
+      s.id = 'gmr-meet-interceptor';
+      s.src = chrome.runtime.getURL('meet-interceptor.js');
+      (document.head || document.documentElement).appendChild(s);
+      console.log('[GMR Content] Injected meet-interceptor.js into main world');
+    } catch (err) {
+      console.warn('[GMR Content] Failed to inject meet-interceptor.js:', err);
+    }
+  }
+
+  // High-precision Protobuf-sourced users from WebRTC DataChannels / SyncMeetingSpaceCollections
+  const interceptorUsersByDeviceId = new Map();
+
+  window.addEventListener('message', (event) => {
+    if (event.source !== window || !event.data || event.data.source !== 'MEET_INTERCEPTOR') return;
+
+    if (event.data.type === 'PARTICIPANTS_UPDATE') {
+      const users = event.data.users || [];
+      const now = Date.now();
+      let changed = false;
+
+      for (const u of users) {
+        if (!u.deviceId || !u.fullName) continue;
+        interceptorUsersByDeviceId.set(u.deviceId, u);
+
+        const normName = cleanName(u.fullName);
+        if (!normName || !isPlausibleName(normName)) continue;
+        const id = normName.toLowerCase();
+
+        const existing = participantCache.get(id);
+        if (!existing) {
+          participantCache.set(id, {
+            id: id,
+            name: normName,
+            joinedAt: now,
+            lastSeen: now,
+            leftAt: null,
+            missingSince: null
+          });
+          changed = true;
+          console.log('[GMR Content] Participant JOIN (WebRTC Protobuf):', normName);
+          emitParticipantEvent('joined', normName, id);
+        } else {
+          existing.lastSeen = now;
+          existing.missingSince = null;
+          if (existing.leftAt) {
+            existing.leftAt = null;
+            changed = true;
+            console.log('[GMR Content] Participant REJOIN (WebRTC Protobuf):', normName);
+            emitParticipantEvent('joined', normName, id);
+          }
+        }
+      }
+
+      if (changed) {
+        pushParticipantState(true);
+      }
+    }
+
+    if (event.data.type === 'CAPTION_UPDATE') {
+      const cap = event.data.caption;
+      if (cap && cap.text) {
+        let speaker = cap.speakerName;
+        if (!speaker && cap.deviceId) {
+          const u = interceptorUsersByDeviceId.get(cap.deviceId);
+          speaker = u ? u.fullName : null;
+        }
+        speaker = normalizeSpeaker(speaker || 'Unknown');
+        const replace = !cap.isFinal;
+        emitTranscriptLine(speaker, cap.text, replace);
+      }
+    }
+  });
+
   function setupParticipantTracking() {
-    console.log('[GMR Content] Setting up participant tracking (snapshot-diff engine)...');
+    console.log('[GMR Content] Setting up participant tracking (snapshot-diff + WebRTC engine)...');
+    injectMeetInterceptor();
 
     // A mutation anywhere in the call surface triggers a (debounced) reconcile so joins/leaves
     // are caught quickly, in addition to the steady RECONCILE_INTERVAL_MS heartbeat.
@@ -1002,6 +1081,13 @@
       const norm = disp.toLowerCase();
       if (!found.has(norm)) found.set(norm, disp);
     };
+
+    // WEBRTC PROTOBUF SOURCE (highest precision): Include users known from DataChannels/RPCs
+    for (const u of interceptorUsersByDeviceId.values()) {
+      if (u.status === 'in_meeting' && u.fullName) {
+        addName(u.fullName);
+      }
+    }
 
     // PRIMARY: the People panel lists each participant exactly once, with their real name.
     const panelNames = readPeoplePanel();
@@ -1376,6 +1462,7 @@
     /\b(and shapes|ink tool|annotation tool)\b/i, // generic catch-all for future toolbar items
     /^(thin|medium|thick|small|large)$/i,  // annotation stroke size labels
     /^(undo|redo|clear all)$/i,            // annotation action buttons
+    /\b(colou?r)\s+(green|red|blue|yellow|black|white|orange|purple|pink|gray|grey|brown)\b/i, // annotation color picker labels
     // ── Breakout room labels ─────────────────────────────────────────────────────
     /^breakout room\b/i,
     /^move to\b/i,                         // "Move to breakout room"
