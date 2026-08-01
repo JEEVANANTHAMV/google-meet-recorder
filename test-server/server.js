@@ -110,15 +110,24 @@ function distinctParticipantCount(events) {
 }
 
 // Replay the participant event log into a current roster (who is in / who left).
+// Each distinct join/leave window is tracked separately; the roster entry for a person
+// shows their EARLIEST joinedAt and their LATEST leftAt so the full attendance span is
+// visible, and the events array carries every individual segment for detailed analysis.
 function buildRoster(events) {
   const map = new Map();
   for (const e of events) {
     const key = e.participantId || e.name;
     if (!key) continue;
     if (e.event === 'joined') {
-      if (!map.has(key) || map.get(key).leftAt) {
+      const existing = map.get(key);
+      if (!existing) {
+        // First time seen: create the entry with original joinedAt
         map.set(key, { id: e.participantId || null, name: e.name, joinedAt: e.timestamp, leftAt: null });
+      } else if (existing.leftAt) {
+        // Rejoin after leave: preserve the EARLIEST joinedAt, clear leftAt (back in call)
+        map.set(key, { id: e.participantId || null, name: e.name, joinedAt: existing.joinedAt, leftAt: null });
       }
+      // If leftAt is null, they never left — duplicate joined event; skip (server dedup handles this)
     } else if (e.event === 'left' && map.has(key)) {
       map.get(key).leftAt = e.timestamp;
     }

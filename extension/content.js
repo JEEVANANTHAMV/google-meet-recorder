@@ -1354,7 +1354,11 @@
     // "Sharon Windows" are plausible people, "Enter full screen" is not.
     /^(open|show|enter|exit|close|start|stop|share|present|pin|unpin|mute|unmute|remove|add|invite|join|leave|turn|switch|view|hide)\b.*\b(window|screen|tab|anyway|everyone|call|people|now|here|mode|layout|others)\b/i,
     /^(enter|exit) full ?screen\b/i,       // the fullscreen toggles specifically
-    /^open in\b/i                          // "Open in new window" / "Open in new tab"
+    /^open in\b/i,                         // "Open in new window" / "Open in new tab"
+    // Mic/camera toolbar button labels: "Unmute your microphone", "Turn on your camera",
+    // "Turn off your video". Any verb + "your" + device/action word is always a toolbar label.
+    /^(mute|unmute|turn on|turn off|enable|disable|use)\b.+\b(microphone|camera|video|audio|speaker|mic)\b/i,
+    /\b(microphone|your camera|your video|your mic|your audio)\b/i
   ];
 
   function isUiPhraseNoise(s) {
