@@ -279,6 +279,7 @@
   // ==================== WEBRTC INTERCEPTOR ====================
   const origRTC = window.RTCPeerConnection;
   window.RTCPeerConnection = function (...args) {
+    console.log('[MeetInterceptor] Intercepted RTCPeerConnection creation');
     const pc = Reflect.construct(origRTC, args);
 
     pc.addEventListener('datachannel', event => {
@@ -299,6 +300,7 @@
   function handleDataChannel(channel) {
     if (!channel || channel.__intercepted) return;
     channel.__intercepted = true;
+    console.log('[MeetInterceptor] Intercepted DataChannel:', channel.label);
 
     if (channel.label === 'collections') {
       channel.addEventListener('message', async event => {

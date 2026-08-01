@@ -1463,6 +1463,7 @@
     /^(thin|medium|thick|small|large)$/i,  // annotation stroke size labels
     /^(undo|redo|clear all)$/i,            // annotation action buttons
     /\b(colou?r)\s+(green|red|blue|yellow|black|white|orange|purple|pink|gray|grey|brown)\b/i, // annotation color picker labels
+    /^(stickers?|emojis?|reactions?|stamps?)$/i, // annotation & reaction toolbar labels
     // ── Breakout room labels ─────────────────────────────────────────────────────
     /^breakout room\b/i,
     /^move to\b/i,                         // "Move to breakout room"

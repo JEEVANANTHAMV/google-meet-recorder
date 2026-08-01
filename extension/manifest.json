@@ -34,6 +34,13 @@
   "content_scripts": [
     {
       "matches": ["https://meet.google.com/*"],
+      "js": ["meet-interceptor.js"],
+      "run_at": "document_start",
+      "world": "MAIN",
+      "all_frames": false
+    },
+    {
+      "matches": ["https://meet.google.com/*"],
       "js": ["content.js"],
       "run_at": "document_idle",
       "all_frames": false

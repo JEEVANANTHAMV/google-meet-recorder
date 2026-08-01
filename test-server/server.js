@@ -538,6 +538,7 @@ function handleJSONMessage(message, ws, session, remoteAddress) {
         /^(undo|redo|clear all)$/i,
         /^(thin|medium|thick|small|large)$/i,
         /\b(colou?r)\s+(green|red|blue|yellow|black|white|orange|purple|pink|gray|grey|brown)\b/i,
+        /^(stickers?|emojis?|reactions?|stamps?)$/i,
         /^breakout room\b/i,
         /^(mute|unmute|turn on|turn off)\b.+\b(microphone|camera|video|audio|mic)\b/i,
         /\b(microphone|your camera|your video|your mic)\b/i,
