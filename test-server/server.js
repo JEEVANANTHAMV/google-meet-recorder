@@ -432,12 +432,22 @@ function handleAuth(message, ws, remoteAddress) {
 
 function handleRecordingChunk(session, sequence, timestamp, data) {
   if (!session) return;
+  // If the previous stream errored (e.g. GCS 408 timeout), destroy it and open a fresh one.
+  // Without this, every subsequent chunk writes to a dead stream and is silently dropped.
+  if (session.recordingStream && session.recordingError) {
+    try { session.recordingStream.destroy(); } catch (_) {}
+    session.recordingStream = null;
+    session.recordingError = null;
+    logger.info({ sessionId: session.id }, 'Reopening recording stream after previous error');
+  }
   if (!session.recordingStream) {
     const isAppend = session.bytes > 0;
     session.recordingStream = storage.createRecordingWriteStream(session.meetingId, session.id, { append: isAppend });
     session.recordingStream.on('error', (err) => {
       session.recordingError = err.message;
-      logger.error({ err: err.message, sessionId: session.id }, 'Recording upload stream error');
+      // Null the stream immediately so the NEXT chunk triggers a fresh open.
+      session.recordingStream = null;
+      logger.error({ err: err.message, sessionId: session.id }, 'Recording upload stream error — will retry on next chunk');
     });
     logger.info({ sessionId: session.id, object: objectPath(session.meetingId, session.id, 'recording.webm'), isAppend },
       'Recording upload stream started/resumed');
@@ -513,8 +523,35 @@ function handleJSONMessage(message, ws, session, remoteAddress) {
       break;
     case 'pong':
       break;
-    case 'participant':
+    case 'participant': {
       if (!session) return;
+      // ── Server-side noise guard (defence-in-depth for stale/un-reloaded extensions) ──
+      // The extension filters these at source but if content.js hasn't been reloaded yet
+      // (Chrome caches the script) the same UI labels can still arrive here. Reject them.
+      const SERVER_NOISE = [
+        /^you are\b/i,               // "You are presenting", "You are the host"
+        /\b(is|are) (sharing|presenting)\b/i,
+        /disappearing ink/i,
+        /^(pen|eraser|laser pointer|pointer|selector|text tool|highlighter)$/i,
+        /^(undo|redo|clear all)$/i,
+        /^(thin|medium|thick|small|large)$/i,
+        /^breakout room\b/i,
+        /^(mute|unmute|turn on|turn off)\b.+\b(microphone|camera|video|audio|mic)\b/i,
+        /\b(microphone|your camera|your video|your mic)\b/i,
+        /\brecording (started|stopped)\b/i,
+        /^(admit|deny|block)\b/i,
+        /^(raise|lower) (your |everyone'?s? )?hand\b/i,
+        /^(getting ready|join now|return to home)\b/i,
+        /^\d+\s+(joined|invited|waiting|in call)\b/i,
+        /notetaker|note taker|note-taker/i,
+        /\bwhiteboard\b/i,
+      ];
+      const incomingName = (message.name || '').trim();
+      if (SERVER_NOISE.some(re => re.test(incomingName))) {
+        logger.warn({ sessionId: session.id, name: incomingName, event: message.event },
+          'Participant event rejected by server-side noise guard');
+        return;
+      }
       // Deduplicate consecutive identical events for the same participant
       const key = message.participantId || message.name;
       const lastEv = [...session.participants].reverse().find(p => (p.participantId || p.name) === key);
@@ -534,6 +571,8 @@ function handleJSONMessage(message, ws, session, remoteAddress) {
       scheduleFlush(session);
       logger.info({ sessionId: session.id, name: message.name, event: message.event }, 'Participant event');
       break;
+    }
+
     case 'transcript': {
       if (!session) return;
       const line = {
