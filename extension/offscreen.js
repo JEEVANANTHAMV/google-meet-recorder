@@ -484,6 +484,8 @@ function sendRecordingEnd() {
 
 // Monitor audio level for diagnostics only. With tab capture an audio track is always present,
 // and a quiet moment is NOT "missing audio", so we only log here (no misleading user warning).
+// FIX: Use a flag to stop the recursive loop when recording stops, preventing AudioContext leaks
+// when a recording is restarted (new context created before old loop exits).
 function monitorAudioVolume(audioTrack) {
   try {
     const audioContext = new AudioContext();
@@ -494,10 +496,14 @@ function monitorAudioVolume(audioTrack) {
 
     const dataArray = new Uint8Array(analyser.frequencyBinCount);
     let silentTicks = 0;
+    // Capture the mediaRecorder reference at start time so the loop closure
+    // doesn't accidentally reference a future recording's recorder object.
+    const monitoredRecorder = mediaRecorder;
 
     const checkVolume = () => {
-      if (!mediaRecorder || mediaRecorder.state === 'inactive') {
-        audioContext.close();
+      // Stop if the recorder we were monitoring is gone or inactive.
+      if (!monitoredRecorder || monitoredRecorder.state === 'inactive' || mediaRecorder !== monitoredRecorder) {
+        try { audioContext.close(); } catch (e) { /* ignore */ }
         return;
       }
 
@@ -620,7 +626,11 @@ function closeWebSocket() {
 
 function scheduleReconnect() {
   if (reconnectTimer) return;
-  
+  // FIX: Do NOT reconnect if this was an intentional stop (user/meeting ended the recording).
+  // Previously, ws.onclose called scheduleReconnect() unconditionally, so stopping recording
+  // would kick off a reconnect loop if recordingStartTime hadn't been cleared yet.
+  if (stoppingIntentionally) return;
+
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null;
     if (recordingStartTime) {

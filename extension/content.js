@@ -668,7 +668,11 @@
       gmrState = { ...gmrState, ...data };
       updatePanelUI(gmrState);
     });
-    
+
+    // FIX: Throttle UI redraws via requestAnimationFrame so rapid storage writes (every transcript
+    // line, every participant event, every WS ping) don't each force a synchronous DOM update.
+    // Without this, updatePanelUI() was called many times per second during an active recording.
+    let uiUpdateQueued = false;
     chrome.storage.onChanged.addListener((changes, namespace) => {
       if (namespace === 'local') {
         const updated = {};
@@ -679,7 +683,14 @@
         // immediately reflects Meet's current state (e.g. faculty who start already muted).
         if ('isRecording' in changes) lastReportedMicMuted = null;
         gmrState = { ...gmrState, ...updated };
-        updatePanelUI(gmrState);
+        // Defer the actual DOM update to the next animation frame.
+        if (!uiUpdateQueued) {
+          uiUpdateQueued = true;
+          requestAnimationFrame(() => {
+            uiUpdateQueued = false;
+            updatePanelUI(gmrState);
+          });
+        }
       }
     });
   }
@@ -823,9 +834,14 @@
     if (gmrState.isRecording) {
       const leaveBtn = document.querySelector('[aria-label*="leave" i], [aria-label*="salir" i], [jsname="b3F6wd"]');
 
-      const hasReturnHome = Array.from(document.querySelectorAll('button, a')).some(el => {
-        const text = (el.textContent || '').toLowerCase();
-        return text.includes('return to home') || text.includes('volver a la pantalla');
+      // FIX: Replaced querySelectorAll('button, a').some(textContent check) (O(n) DOM walk)
+      // with a targeted attribute selector. Much cheaper — no element enumeration needed.
+      const hasReturnHome = !!document.querySelector(
+        'button[aria-label*="return to home" i], a[aria-label*="return to home" i], ' +
+        '[data-call-ended], [jsname*="leave"]'
+      ) || !!Array.from(document.querySelectorAll('h1, h2, [role="heading"]')).some(el => {
+        const t = (el.textContent || '').toLowerCase();
+        return t.includes('return to home') || t.includes('volver a la pantalla');
       });
 
       if (hasReturnHome || !leaveBtn) {
@@ -884,16 +900,22 @@
   // (covers the button being re-rendered / not yet present at init).
   function setupMicMuteObserver() {
     if (micMuteObserver) micMuteObserver.disconnect();
-    // Observe broadly but cheaply: only attribute changes to aria-label / data-is-muted anywhere in
-    // the toolbar trigger our (debounced) check. Meet re-renders the button, so we watch document.
+    // FIX: Observe only the toolbar region (if available) instead of the entire document.
+    // Watching document with subtree:true + attributeFilter fires hundreds of times per minute
+    // in an active Meet call because aria-label changes on captions, tiles, and every toolbar button.
+    // We try to narrow the watch target to the Meet bottom toolbar; fall back to document only
+    // if the toolbar element can't be found (it will be retried next time this is called).
+    const toolbarRoot = document.querySelector(
+      '[data-call-media-container], [jsname="r4nke"], [jsname="Qx7uuf"], footer, [role="toolbar"]'
+    ) || document;
     micMuteObserver = new MutationObserver(() => {
       if (micMuteDebounce) return;
-      micMuteDebounce = setTimeout(() => { micMuteDebounce = null; syncMicMuteState(); }, 60);
+      micMuteDebounce = setTimeout(() => { micMuteDebounce = null; syncMicMuteState(); }, 150);
     });
-    micMuteObserver.observe(document, {
+    micMuteObserver.observe(toolbarRoot, {
       subtree: true,
       attributes: true,
-      attributeFilter: ['aria-label', 'data-is-muted']
+      attributeFilter: ['aria-label', 'data-is-muted', 'aria-pressed']
     });
   }
 
@@ -1015,10 +1037,16 @@
     console.log('[GMR Content] Setting up participant tracking (snapshot-diff + WebRTC engine)...');
     injectMeetInterceptor();
 
-    // A mutation anywhere in the call surface triggers a (debounced) reconcile so joins/leaves
-    // are caught quickly, in addition to the steady RECONCILE_INTERVAL_MS heartbeat.
+    // FIX: Observe the Meet call surface (main content area) rather than the entire document.body.
+    // document.body with subtree:true fires on EVERY DOM mutation in Meet (captions, tiles, chat,
+    // toolbar states) which is tens of mutations per second during a call. We look for the main
+    // meeting container first; fall back to body only if unavailable. The periodic RECONCILE_INTERVAL_MS
+    // loop is the primary heartbeat — the observer is just a fast-path supplement.
+    const callRoot = document.querySelector(
+      '[data-call-media-container], [jsname="obd8sd"], [jsname="F0y4sd"], main, #ow3'
+    ) || document.body;
     participantObserver = new MutationObserver(() => scheduleReconcile());
-    participantObserver.observe(document.body, { childList: true, subtree: true });
+    participantObserver.observe(callRoot, { childList: true, subtree: true });
 
     // Catch sudden tab / browser window closures or page teardowns instantly
     window.addEventListener('beforeunload', markAllParticipantsLeft, { capture: true });
@@ -1066,8 +1094,19 @@
       'button[aria-label*="switch here" i], button[aria-label*="return to home screen" i]'
     );
     if (joinBtn) return false;
-    if (/\b(join now|ask to join|ready to join|getting ready)\b/i.test(document.body.innerText || '')) {
-      return false;
+
+    // FIX: Replaced document.body.innerText (full layout reflow) with targeted aria-label
+    // selectors to detect the lobby state cheaply without forcing a page-wide text computation.
+    const lobbyText = document.querySelector(
+      'button[aria-label*="join now" i], button[aria-label*="ask to join" i], ' +
+      '[aria-label*="ready to join" i], [aria-label*="getting ready" i], ' +
+      '[data-allocation-token], h1[jsname], span[jsname]'
+    );
+    if (lobbyText) {
+      // Narrow check: only reject lobby if the visible heading text looks like a lobby state.
+      // Using textContent on a small targeted element is safe (no layout reflow).
+      const tc = (lobbyText.textContent || '').toLowerCase();
+      if (/\b(join now|ask to join|ready to join|getting ready)\b/.test(tc)) return false;
     }
 
     // Fallback: the in-call toolbar exposes mic/camera toggles.
@@ -2329,7 +2368,8 @@
   } else {
     initialize();
   }
-
-  setTimeout(initialize, 3000);
+  // NOTE: Do NOT add a second setTimeout(initialize, ...) here.
+  // initialize() is already guarded by `isInitialized`, but the periodic
+  // interval is re-created on each call which doubles the polling rate.
 
 })();
