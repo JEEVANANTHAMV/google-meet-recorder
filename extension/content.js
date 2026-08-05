@@ -891,23 +891,26 @@
   // Meet's toolbar mic toggle: aria-label reads "Turn off microphone" when you are LIVE (unmuted),
   // and "Turn on microphone" when you are MUTED. data-is-muted="true" is also present on newer DOM.
   function readMicMuted() {
-    // Prefer the explicit muted-state attribute when present.
-    const stateEl = document.querySelector('[data-is-muted]');
-    if (stateEl) {
-      const v = stateEl.getAttribute('data-is-muted');
-      if (v === 'true') return true;
-      if (v === 'false') return false;
-    }
-    // Fall back to the toolbar button's aria-label.
-    const turnOn = document.querySelector(
-      'button[aria-label*="turn on microphone" i], button[aria-label*="activar micrófono" i]'
+    // Target ONLY the bottom toolbar microphone button (not arbitrary participant tiles in the grid).
+    const micBtn = document.querySelector(
+      'button[jsname="B3f2vd"], button[aria-label*="turn off microphone" i], ' +
+      'button[aria-label*="turn on microphone" i], button[aria-label*="microphone" i]'
     );
-    if (turnOn) return true;   // "Turn ON microphone" is offered => currently muted
-    const turnOff = document.querySelector(
-      'button[aria-label*="turn off microphone" i], button[aria-label*="desactivar micrófono" i]'
-    );
-    if (turnOff) return false; // "Turn OFF microphone" is offered => currently live
-    return null;               // unknown (button not found) — don't change state
+    if (!micBtn) return null;
+
+    const label = (micBtn.getAttribute('aria-label') || '').toLowerCase();
+    // "Turn off microphone" = mic is currently ON / LIVE (unmuted)
+    if (label.includes('turn off') || label.includes('desactivar')) return false;
+    // "Turn on microphone" = mic is currently OFF (muted)
+    if (label.includes('turn on') || label.includes('activar')) return true;
+
+    // Check attributes on the toolbar mic button ONLY
+    if (micBtn.getAttribute('data-is-muted') === 'true') return true;
+    if (micBtn.getAttribute('data-is-muted') === 'false') return false;
+    if (micBtn.getAttribute('aria-pressed') === 'false') return true;
+    if (micBtn.getAttribute('aria-pressed') === 'true') return false;
+
+    return null; // unknown (button not found) — don't change state
   }
 
   function syncMicMuteState() {
@@ -1994,47 +1997,73 @@
     const now = Date.now();
     const blocks = [];
 
-    // Strategy 1: Look for child block containers inside captions region
-    const childBlocks = container.children.length > 0 ? Array.from(container.children) : [container];
+    // Search for individual caption items or region elements inside container
+    let items = container.querySelectorAll('.vNKgIf, .UDinHf, .TBMuR, .bY93Qe, .Mz6pEf, [role="region"]');
+    if (!items || items.length === 0) {
+      items = container.children.length > 0 ? Array.from(container.children) : [container];
+    }
 
-    childBlocks.forEach(block => {
+    items.forEach(item => {
       let rawSpeaker = null;
       let text = '';
 
-      const imgOrAvatar = block.querySelector('img, svg, [data-self-name], .PABS8e, .Mz6pEf');
-      if (imgOrAvatar) {
-        const header = imgOrAvatar.parentElement || imgOrAvatar;
-        rawSpeaker = cleanName(header.textContent);
+      // Clean navigation buttons or UI badges from item text (e.g. "arrow_downwardJump to the bottom")
+      let full = (item.textContent || '').replace(/arrow_downward\s*Jump to the bottom/gi, '').trim();
+
+      // 1. Isolate speaker element if present
+      const speakerEl = item.querySelector('.PABS8e, [data-self-name], img, svg');
+      if (speakerEl) {
+        const header = speakerEl.closest('div, span') || speakerEl;
+        rawSpeaker = cleanName(header.textContent || speakerEl.getAttribute('data-self-name'));
       }
 
-      const fullText = (block.textContent || '').trim();
+      // 2. Isolate explicit text element if present (.bY97s is Meet's caption text class)
+      const textEl = item.querySelector('.bY97s, .V6Yesc, .TBMuR');
+      if (textEl && textEl !== speakerEl) {
+        text = (textEl.textContent || '').replace(/arrow_downward\s*Jump to the bottom/gi, '').trim();
+      }
 
-      if (!rawSpeaker) {
-        const lines = fullText.split('\n').map(l => l.trim()).filter(Boolean);
-        if (lines.length >= 2 && lines[0].length < 40) {
-          rawSpeaker = cleanName(lines[0]);
-          text = lines.slice(1).join(' ');
+      // 3. Fallback extraction for combined strings (e.g. "YouI hope my voice is clear...")
+      if (!text || (rawSpeaker && text.toLowerCase() === rawSpeaker.toLowerCase())) {
+        if (/^you(?=[A-Z\s])/i.test(full)) {
+          if (!rawSpeaker) rawSpeaker = 'You';
+          text = full.replace(/^you\s*/i, '').trim();
+        } else if (rawSpeaker && full.toLowerCase().startsWith(rawSpeaker.toLowerCase())) {
+          text = full.slice(rawSpeaker.length).trim();
         } else {
-          rawSpeaker = 'Unknown';
-          text = fullText;
+          const lines = full.split('\n').map(l => l.trim()).filter(Boolean);
+          if (lines.length >= 2 && lines[0].length < 40) {
+            if (!rawSpeaker) rawSpeaker = cleanName(lines[0]);
+            text = lines.slice(1).join(' ');
+          } else {
+            text = full;
+          }
         }
-      } else {
-        text = fullText;
-        if (rawSpeaker && rawSpeaker !== 'Unknown' && text.startsWith(rawSpeaker)) {
-          text = text.slice(rawSpeaker.length);
-        }
-        text = text.replace(/^[\s:–-]+/, '').trim();
       }
 
-      const speaker = normalizeSpeaker(rawSpeaker || 'Unknown');
-      if (text && text.length > 1) {
+      text = text.replace(/^[\s:–-]+/, '').trim();
+
+      // If text still starts with speaker label (e.g. "You Terminal..."), strip it off
+      if (rawSpeaker && text.toLowerCase().startsWith(rawSpeaker.toLowerCase())) {
+        text = text.slice(rawSpeaker.length).replace(/^[\s:–-]+/, '').trim();
+      }
+
+      const speaker = normalizeSpeaker(rawSpeaker || 'You');
+
+      // Only push valid spoken text (must not equal the speaker label itself)
+      if (text && text.length > 1 && text.toLowerCase() !== speaker.toLowerCase() && text.toLowerCase() !== 'you') {
         blocks.push({ speaker, text });
       }
     });
 
     if (blocks.length === 0) {
-      const raw = (container.textContent || '').trim();
-      if (raw) blocks.push({ speaker: normalizeSpeaker('You'), text: raw });
+      let raw = (container.textContent || '').replace(/arrow_downward\s*Jump to the bottom/gi, '').trim();
+      if (/^you(?=[A-Z\s])/i.test(raw)) {
+        raw = raw.replace(/^you\s*/i, '').trim();
+      }
+      if (raw && raw.length > 1) {
+        blocks.push({ speaker: normalizeSpeaker('You'), text: raw });
+      }
     }
 
     for (const b of blocks) {

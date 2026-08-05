@@ -15,7 +15,7 @@ let state = {
   transcriptLines: [],
   activityLog: [],
   recordingError: null,
-  micEnabled: false
+  micEnabled: true
 };
 
 // Timer interval

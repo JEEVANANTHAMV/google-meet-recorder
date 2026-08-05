@@ -21,6 +21,7 @@ chrome.runtime.onInstalled.addListener(() => {
     recordingStartTime: null,
     totalParticipants: 0,
     activeParticipants: 0,
+    micEnabled: true,
     transcriptLines: [],
     activityLog: [],
     bindingByMeeting: {}
@@ -195,6 +196,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         case 'CHUNK_RECORDED':
           await handleChunkRecorded(message, sendResponse);
           break;
+        case 'OPEN_PERMISSION_TAB':
+          chrome.tabs.create({ url: chrome.runtime.getURL('permission.html') });
+          sendResponse({ success: true });
+          break;
         
         // WebSocket events (forwarded from offscreen or popup)
         case 'WS_STATUS':
@@ -287,7 +292,7 @@ async function handleStartRecording(message, sendResponse) {
     email: data.userEmail || null,
     accessKey: data.accessKey || null,
     streamId,
-    captureMic: data.micEnabled === true
+    captureMic: data.micEnabled !== false
   });
 
   if (result.success) {
