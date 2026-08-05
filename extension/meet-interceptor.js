@@ -290,9 +290,10 @@
   function handleDataChannel(channel) {
     if (!channel || channel.__intercepted) return;
     channel.__intercepted = true;
-    console.log('[MeetInterceptor] Intercepted DataChannel:', channel.label);
+    const label = channel.label || '';
+    console.log('[MeetInterceptor] Intercepted DataChannel:', label);
 
-    if (channel.label === 'collections') {
+    if (label === 'collections') {
       channel.addEventListener('message', event => {
         try {
           const raw = new Uint8Array(event.data);
@@ -306,7 +307,12 @@
       });
     }
 
-    if (channel.label === 'captions') {
+    // FIX: Match any DataChannel whose label CONTAINS 'caption' (case-insensitive).
+    // Google Meet has rotated this label across builds:
+    //   'captions'  (older)  |  'CaptionsEngineDataChannel'  |  '<roomId>-captions'  (newer)
+    // An exact === check broke silently when the label changed.
+    if (label.toLowerCase().includes('caption')) {
+      console.log('[MeetInterceptor] Captions DataChannel matched:', label);
       channel.addEventListener('message', event => {
         try {
           const raw = new Uint8Array(event.data);

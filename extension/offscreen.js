@@ -119,15 +119,25 @@ async function startRecording(serverUrl, mId, token, streamId, captureMic, email
       });
       console.log('[GMR Offscreen] Tab capture acquired');
     } else {
-      // Fallback: screen/window/tab share. systemAudio:'include' asks Chrome to capture the
-      // speaker/system audio for screen & window shares (supported on Windows/ChromeOS), and tab
-      // shares include tab audio by default — so "entire screen" sharing still records the audio.
+      // Fallback: screen/window/tab share via getDisplayMedia.
+      // NOTE: systemAudio:'include' is only supported on Windows and ChromeOS. On macOS,
+      // Chrome does NOT capture system/tab audio automatically — the user must tick the
+      // "Share tab audio" checkbox inside Chrome's own share picker dialog.
+      // We always include the audio constraint so the checkbox appears; the user must check it.
       captureStream = await navigator.mediaDevices.getDisplayMedia({
         video: { width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 30 } },
         audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, sampleRate: 48000, channelCount: 2 },
         systemAudio: 'include'
       });
-      console.log('[GMR Offscreen] Display media acquired (fallback). Audio tracks:', captureStream.getAudioTracks().length);
+      const audioTracks = captureStream.getAudioTracks();
+      console.log('[GMR Offscreen] Display media acquired (fallback). Audio tracks:', audioTracks.length);
+      if (audioTracks.length === 0) {
+        // On macOS, Chrome does not capture tab/system audio unless the user explicitly
+        // ticks "Share tab audio" in the share picker. Notify the background so the content
+        // script can show the audio warning banner with clear instructions.
+        console.warn('[GMR Offscreen] No audio in display capture — user did not enable "Share tab audio" in the picker, or this is macOS without system audio support.');
+        chrome.runtime.sendMessage({ type: 'RECORDING_STATUS', status: 'recording', audioMissing: true });
+      }
     }
 
     console.log('[GMR Offscreen] Capture tracks:', captureStream.getTracks().map(t => ({ kind: t.kind, label: t.label })));

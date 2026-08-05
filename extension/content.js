@@ -779,11 +779,22 @@
 
   // Locate the closed-captions TOGGLE button (not the settings tab / menu item).
   function findCaptionButton() {
-    const ccButtons = document.querySelectorAll('button[aria-label*="caption" i], button[data-tooltip*="caption" i], button[aria-label*="cc" i], button[data-tooltip*="cc" i]');
+    // Broader set of selectors covering current and older Meet builds.
+    const ccButtons = document.querySelectorAll(
+      'button[aria-label*="caption" i], button[data-tooltip*="caption" i], ' +
+      'button[aria-label*="cc" i], button[data-tooltip*="cc" i], ' +
+      'button[jsname="r8qRAd"], button[jsname="pSB8X"]'  // known jsnames for the CC toggle
+    );
     for (const btn of ccButtons) {
       const label = (btn.getAttribute('aria-label') || '').toLowerCase();
       const tooltip = (btn.getAttribute('data-tooltip') || '').toLowerCase();
-      if (label === 'captions' || tooltip === 'captions' || label.includes('settings') || tooltip.includes('settings') || btn.getAttribute('role') === 'tab') {
+      // Skip the CC settings tab (has 'settings' in label) and aria role=tab items.
+      if (label.includes('settings') || tooltip.includes('settings') || btn.getAttribute('role') === 'tab') {
+        continue;
+      }
+      // Skip the plain label "Captions" that just names the feature section (not a toggle).
+      // A real toggle button will have something like "Turn on captions" or "Turn off captions".
+      if ((label === 'captions' || tooltip === 'captions') && !btn.getAttribute('aria-pressed')) {
         continue;
       }
       return btn;
@@ -793,10 +804,21 @@
 
   function isCaptionOn(btn) {
     if (!btn) return false;
+    // aria-pressed=true is the most reliable signal.
     if (btn.getAttribute('aria-pressed') === 'true') return true;
     const label = (btn.getAttribute('aria-label') || '').toLowerCase();
-    return label.includes('turn off') || label.includes('desactivar') || label.includes('stop captions');
+    // "Turn off captions" / "Turn off live captions" / "Stop captions" = captions are ON.
+    if (label.includes('turn off') || label.includes('stop captions') || label.includes('desactivar')) return true;
+    // Some Meet builds use data-is-muted style toggling on the CC button.
+    if (btn.getAttribute('data-is-active') === 'true') return true;
+    // If the label says "captions" without a verb and aria-pressed is missing, treat as unknown (not on).
+    return false;
   }
+
+  // Last time we successfully clicked the caption button. Prevents rapid on-off toggling
+  // if isCaptionOn() takes a moment to reflect the new state after a click.
+  let lastCaptionClickAt = 0;
+  const CAPTION_CLICK_COOLDOWN_MS = 3000; // don't click again for at least 3s after the last click
 
   // Ensure captions stay ON. If the user turns them OFF after we've enabled them, re-enable and
   // warn that transcription needs captions. Only runs while inside the call.
@@ -818,12 +840,17 @@
     if (isUserTyping()) return false;
 
     const now = Date.now();
+    // FIX: Don't click again if we already clicked recently — isCaptionOn() may take a render
+    // cycle to update after the click, so repeated rapid clicks toggled captions on/off every 2s.
+    if (now - lastCaptionClickAt < CAPTION_CLICK_COOLDOWN_MS) return false;
+
     if (captionsArmed && now > captionWarnCooldownUntil) {
       // We had captions on and they're off now -> the user turned them off.
       showToast('Live captions are required for transcription. We\'ve turned them back on — the transcript won\'t be captured if you turn captions off again.', 'warn');
     }
     console.log('[GMR Content] Enabling closed captions...');
     btn.click();
+    lastCaptionClickAt = now;
     captionsArmed = true;
     captionWarnCooldownUntil = now + 4000; // suppress duplicate warnings while the UI settles
     return true;
@@ -2171,7 +2198,7 @@
       createDOMElement('div', { className: 'gmr-warning-inner' }, [
         createDOMElement('span', { className: 'gmr-warning-icon' }, ['⚠️']),
         createDOMElement('span', { className: 'gmr-warning-text' }, [
-          'This will not capture participant audio. Click "Record Again" or "Continue" to proceed.'
+          'No audio captured. Click "Record Again" — in Chrome\'s share picker, select the Meet tab and check ✅ "Share tab audio" at the bottom of the dialog.'
         ]),
         actionsDiv
       ])
