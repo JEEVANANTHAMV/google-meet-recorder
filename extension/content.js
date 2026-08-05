@@ -779,21 +779,29 @@
 
   // Locate the closed-captions TOGGLE button (not the settings tab / menu item).
   function findCaptionButton() {
-    // Broader set of selectors covering current and older Meet builds.
+    // 1) Direct jsname hook (Google Meet stable internal toggle: RrG0hf is current Meet)
+    const byJsname = document.querySelector('button[jsname="RrG0hf"], button[jsname="r8qRAd"], button[jsname="pSB8X"]');
+    if (byJsname) return byJsname;
+
+    // 2) Explicit aria-label matching "Turn on captions" or "Turn off captions"
+    const byLabel = document.querySelector(
+      'button[aria-label*="turn on caption" i], button[aria-label*="turn off caption" i], ' +
+      'button[aria-label*="turn on closed caption" i], button[aria-label*="turn off closed caption" i]'
+    );
+    if (byLabel) return byLabel;
+
+    // 3) Broader set of selectors covering older Meet builds.
     const ccButtons = document.querySelectorAll(
       'button[aria-label*="caption" i], button[data-tooltip*="caption" i], ' +
-      'button[aria-label*="cc" i], button[data-tooltip*="cc" i], ' +
-      'button[jsname="r8qRAd"], button[jsname="pSB8X"]'  // known jsnames for the CC toggle
+      'button[aria-label*="cc" i], button[data-tooltip*="cc" i]'
     );
     for (const btn of ccButtons) {
       const label = (btn.getAttribute('aria-label') || '').toLowerCase();
       const tooltip = (btn.getAttribute('data-tooltip') || '').toLowerCase();
-      // Skip the CC settings tab (has 'settings' in label) and aria role=tab items.
-      if (label.includes('settings') || tooltip.includes('settings') || btn.getAttribute('role') === 'tab') {
+      // Skip the CC settings tab and language dropdowns.
+      if (label.includes('settings') || tooltip.includes('settings') || label.includes('language') || btn.getAttribute('role') === 'tab') {
         continue;
       }
-      // Skip the plain label "Captions" that just names the feature section (not a toggle).
-      // A real toggle button will have something like "Turn on captions" or "Turn off captions".
       if ((label === 'captions' || tooltip === 'captions') && !btn.getAttribute('aria-pressed')) {
         continue;
       }
@@ -804,21 +812,17 @@
 
   function isCaptionOn(btn) {
     if (!btn) return false;
-    // aria-pressed=true is the most reliable signal.
     if (btn.getAttribute('aria-pressed') === 'true') return true;
     const label = (btn.getAttribute('aria-label') || '').toLowerCase();
-    // "Turn off captions" / "Turn off live captions" / "Stop captions" = captions are ON.
     if (label.includes('turn off') || label.includes('stop captions') || label.includes('desactivar')) return true;
-    // Some Meet builds use data-is-muted style toggling on the CC button.
     if (btn.getAttribute('data-is-active') === 'true') return true;
-    // If the label says "captions" without a verb and aria-pressed is missing, treat as unknown (not on).
     return false;
   }
 
   // Last time we successfully clicked the caption button. Prevents rapid on-off toggling
   // if isCaptionOn() takes a moment to reflect the new state after a click.
   let lastCaptionClickAt = 0;
-  const CAPTION_CLICK_COOLDOWN_MS = 3000; // don't click again for at least 3s after the last click
+  const CAPTION_CLICK_COOLDOWN_MS = 5000; // don't click again for at least 5s after the last click
 
   // Ensure captions stay ON. If the user turns them OFF after we've enabled them, re-enable and
   // warn that transcription needs captions. Only runs while inside the call.
@@ -834,25 +838,19 @@
     }
 
     // Captions are OFF.
-    // Don't grab focus with the toggle click while the user is typing (e.g. in the chat box) — it
-    // would swallow their keystroke. Skip this tick; the periodic loop retries in ~2s once they're
-    // done typing. Captions being off briefly only delays transcript re-capture, nothing more.
     if (isUserTyping()) return false;
 
     const now = Date.now();
-    // FIX: Don't click again if we already clicked recently — isCaptionOn() may take a render
-    // cycle to update after the click, so repeated rapid clicks toggled captions on/off every 2s.
     if (now - lastCaptionClickAt < CAPTION_CLICK_COOLDOWN_MS) return false;
 
     if (captionsArmed && now > captionWarnCooldownUntil) {
-      // We had captions on and they're off now -> the user turned them off.
       showToast('Live captions are required for transcription. We\'ve turned them back on — the transcript won\'t be captured if you turn captions off again.', 'warn');
     }
     console.log('[GMR Content] Enabling closed captions...');
     btn.click();
     lastCaptionClickAt = now;
     captionsArmed = true;
-    captionWarnCooldownUntil = now + 4000; // suppress duplicate warnings while the UI settles
+    captionWarnCooldownUntil = now + 6000; // suppress duplicate warnings while the UI settles
     return true;
   }
 
@@ -1936,29 +1934,41 @@
   let seenTranscriptKeys = new Set();
 
   function setupTranscriptCapture() {
-    console.log('[GMR Content] Setting up WebRTC DataChannel transcript capture (Attendee architecture)...');
-    // Transcripts are captured 100% via meet-interceptor.js WebRTC DataChannel ('captions' channel Protobuf).
-    // DOM MutationObserver scanning is disabled for 100% Attendee-style zero-DOM-noise performance.
+    console.log('[GMR Content] Setting up transcript capture (DOM Observer + WebRTC DataChannel)...');
+
+    const checkContainer = () => {
+      const container = findCaptionContainer();
+      if (container && container !== transcriptContainer) {
+        transcriptContainer = container;
+        console.log('[GMR Content] Caption container identified:', container);
+        observeTranscript(container);
+      }
+    };
+
+    checkContainer();
+    setInterval(checkContainer, 3000);
+    setInterval(flushStableCaptions, 1000);
   }
 
   function findCaptionContainer() {
     // 1) Accessibility / attribute hooks (most stable).
-    const byAria = document.querySelector('[aria-label*="caption" i][role="region"], [role="region"][aria-label*="caption" i]');
+    const byAria = document.querySelector(
+      '[aria-label*="caption" i][role="region"], [role="region"][aria-label*="caption" i], ' +
+      '[aria-label*="closed caption" i], [jsname="dsyhDe"], [jsname="tgaKEf"]'
+    );
     if (byAria) return byAria;
 
-    // 2) Known (rotating) class/jsname fallbacks.
-    const known = document.querySelector('.a4cQT, .iOzk7, [jsname="dsyhDe"], .V6Yesc');
+    // 2) Known class fallbacks.
+    const known = document.querySelector('.a4cQT, .iOzk7, .V6Yesc, .Mz6pEf, .bY93Qe, .TBMuR');
     if (known) return known;
 
-    // 3) Structural heuristic: the region that holds caption blocks (avatar <img> next to text).
-    const imgs = document.querySelectorAll('img');
+    // 3) Structural heuristic: look for region containing avatar/speaker text
+    const imgs = document.querySelectorAll('img, svg, [data-self-name]');
     for (const img of imgs) {
       const block = img.closest('div');
       if (block && (block.textContent || '').trim().length > 0) {
         const region = block.parentElement && block.parentElement.parentElement;
-        if (region && region.querySelectorAll('img').length >= 1 &&
-            (region.textContent || '').trim().length > 2) {
-          // Heuristic gate: avoid matching the participant grid (which also has avatars).
+        if (region && (region.textContent || '').trim().length > 2) {
           if (/caption|cc/i.test(region.getAttribute('aria-label') || '')) return region;
         }
       }
@@ -1984,43 +1994,52 @@
     const now = Date.now();
     const blocks = [];
 
-    // Primary: anchor on avatar <img>; the speaker name sits in the avatar's wrapper and the
-    // spoken text is the rest of the block.
-    const imgs = container.querySelectorAll('img');
-    imgs.forEach(img => {
-      const header = img.parentElement;
-      if (!header) return;
-      const block = header.parentElement || header;
-      const rawSpeaker = cleanName(header.textContent) || 'Unknown';
-      let text = (block.textContent || '').trim();
-      // Strip the speaker label off the front of the block text using the RAW label, since that is
-      // what actually appears in the DOM ("You"), not the resolved display name.
-      if (rawSpeaker && rawSpeaker !== 'Unknown' && text.startsWith(rawSpeaker)) {
-        text = text.slice(rawSpeaker.length);
+    // Strategy 1: Look for child block containers inside captions region
+    const childBlocks = container.children.length > 0 ? Array.from(container.children) : [container];
+
+    childBlocks.forEach(block => {
+      let rawSpeaker = null;
+      let text = '';
+
+      const imgOrAvatar = block.querySelector('img, svg, [data-self-name], .PABS8e, .Mz6pEf');
+      if (imgOrAvatar) {
+        const header = imgOrAvatar.parentElement || imgOrAvatar;
+        rawSpeaker = cleanName(header.textContent);
       }
-      text = text.replace(/^[\s:–-]+/, '').trim();
-      // Attribute the local user's captions to their real name instead of Meet's literal "You".
-      // Normalizing HERE (not at emit time) keeps captionState keyed by one stable identity, so a
-      // name that resolves mid-utterance can't split one speaker into two growth chains.
-      const speaker = normalizeSpeaker(rawSpeaker);
-      if (text) blocks.push({ speaker, text });
+
+      const fullText = (block.textContent || '').trim();
+
+      if (!rawSpeaker) {
+        const lines = fullText.split('\n').map(l => l.trim()).filter(Boolean);
+        if (lines.length >= 2 && lines[0].length < 40) {
+          rawSpeaker = cleanName(lines[0]);
+          text = lines.slice(1).join(' ');
+        } else {
+          rawSpeaker = 'Unknown';
+          text = fullText;
+        }
+      } else {
+        text = fullText;
+        if (rawSpeaker && rawSpeaker !== 'Unknown' && text.startsWith(rawSpeaker)) {
+          text = text.slice(rawSpeaker.length);
+        }
+        text = text.replace(/^[\s:–-]+/, '').trim();
+      }
+
+      const speaker = normalizeSpeaker(rawSpeaker || 'Unknown');
+      if (text && text.length > 1) {
+        blocks.push({ speaker, text });
+      }
     });
 
-    // Fallback: no avatars (caption-only layout) — split the visible text into "Name\n text" rows.
     if (blocks.length === 0) {
-      const raw = (container.innerText || container.textContent || '').trim();
-      if (raw) blocks.push({ speaker: 'Unknown', text: raw });
+      const raw = (container.textContent || '').trim();
+      if (raw) blocks.push({ speaker: normalizeSpeaker('You'), text: raw });
     }
 
     for (const b of blocks) {
-      // If this speaker was previously tracked under the literal "You" (self-name resolved only
-      // after captions started), carry that growth state over to the real name. Without this the
-      // in-flight utterance would restart under a new key and get appended as a duplicate line
-      // instead of superseding — the exact bloat the replace mechanism exists to prevent.
       if (b.speaker !== 'You' && !captionState.has(b.speaker) && captionState.has('You')) {
         const carried = captionState.get('You');
-        // Remember the old label only if a line was already emitted under it, so the server can
-        // supersede that stored line rather than stranding it.
         if (carried.emittedText) carried.renamedFrom = 'You';
         captionState.set(b.speaker, carried);
         captionState.delete('You');
