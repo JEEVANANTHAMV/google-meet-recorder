@@ -1,0 +1,12 @@
+[Unit]
+Description=Prepare instance-store NVMe SSD for the Google Meet Recorder spool
+After=local-fs.target
+Before=pm2-ubuntu.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/gmr-spool-disk.sh
+
+[Install]
+WantedBy=multi-user.target
