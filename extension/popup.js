@@ -3,7 +3,7 @@
 
 // State
 let state = {
-  wsUrl: 'ws://18.204.127.179:8001',
+  wsUrl: 'wss://erp.lmsmybeta.com/gmr',
   isRecording: false,
   isPaused: false,
   meetingId: null,

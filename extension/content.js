@@ -42,7 +42,7 @@
   const RECONCILE_INTERVAL_MS = 2000; // how often we diff the DOM against the cache
 
   let gmrState = {
-    wsUrl: 'ws://18.204.127.179:8001',
+    wsUrl: 'wss://erp.lmsmybeta.com/gmr',
     isRecording: false,
     isPaused: false,
     meetingId: null,

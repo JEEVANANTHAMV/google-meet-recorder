@@ -621,7 +621,9 @@ function handleAuth(message, ws, remoteAddress) {
         'Session re-attached / resumed for single-file meeting recording');
 
       ws.send(JSON.stringify({
-        type: 'status', ok: true, message: 'Authenticated', sessionId: requested.id, meetingId, reconnected: true
+        type: 'status', ok: true, message: 'Authenticated', sessionId: requested.id, meetingId, reconnected: true,
+        // Last chunk stored: the recorder resends anything after it that was lost in flight.
+        lastSequence: requested.lastSequence
       }));
       return;
     }
@@ -690,10 +692,10 @@ function handleAuth(message, ws, remoteAddress) {
 
 function handleRecordingChunk(session, sequence, timestamp, data) {
   if (!session || session.finalized) return;
-  // The client numbers chunks 1..N for the life of its MediaRecorder and resends nothing, so a
-  // sequence we've already written can only be a duplicate — appending it would corrupt the WebM.
+  // The client numbers chunks 1..N for the life of its MediaRecorder, so a sequence we've already
+  // written is a duplicate (e.g. resent after a reconnect) — appending it would corrupt the WebM.
   if (sequence <= session.lastSequence) {
-    logger.warn({ sessionId: session.id, sequence, lastSequence: session.lastSequence }, 'Dropped out-of-order/duplicate chunk');
+    logger.debug({ sessionId: session.id, sequence, lastSequence: session.lastSequence }, 'Dropped out-of-order/duplicate chunk');
     return;
   }
   if (session.lastSequence && sequence > session.lastSequence + 1) {
@@ -1286,8 +1288,18 @@ const wss = new WebSocket.Server({
   }
 });
 
+// Behind the ERP's nginx (/gmr/ -> :8001) every socket comes from loopback; use the forwarded client
+// address then. Only trusted from loopback so a direct client can't spoof it.
+function clientAddress(req) {
+  const peer = req.socket.remoteAddress || '';
+  const isLoopback = peer === '127.0.0.1' || peer === '::1' || peer === '::ffff:127.0.0.1';
+  const fwd = req.headers['x-forwarded-for'];
+  if (isLoopback && fwd) return String(fwd).split(',')[0].trim();
+  return peer;
+}
+
 wss.on('connection', (ws, req) => {
-  const remoteAddress = req.socket.remoteAddress;
+  const remoteAddress = clientAddress(req);
   logger.info({ remoteAddress, origin: req.headers.origin }, 'WS client connected');
 
   ws.isAlive = true;

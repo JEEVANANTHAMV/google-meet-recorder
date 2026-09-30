@@ -4,10 +4,15 @@
 const OFFSCREEN_DOCUMENT_PATH = 'offscreen.html';
 let creatingOffscreen = false;
 
-// Server endpoints. The recorder speaks WebSocket (ws) for streaming and HTTP (api) for the
-// schedule-binding lookup. Both point at the same host:port.
-const DEFAULT_WS_URL = 'ws://18.204.127.179:8001';
-const DEFAULT_API_BASE = 'http://18.204.127.179:8001';
+// Server endpoints. The recorder speaks WebSocket for streaming and HTTP for the schedule-binding
+// lookup. Primary is TLS through the ERP's nginx (/gmr/ -> recorder on :8001); plain ws:// is often
+// dropped by office firewalls/proxies on long-lived connections. The legacy direct address stays as
+// an automatic fallback.
+const DEFAULT_WS_URL = 'wss://erp.lmsmybeta.com/gmr';
+const DEFAULT_API_BASE = 'https://erp.lmsmybeta.com/gmr';
+const LEGACY_API_BASE = 'http://18.204.127.179:8001';
+// Safety net: close the offscreen document this long after Stop even if it never reports idle.
+const OFFSCREEN_IDLE_FALLBACK_MS = 20 * 60 * 1000;
 
 // Initialize default settings on install
 chrome.runtime.onInstalled.addListener(() => {
@@ -193,6 +198,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         case 'AUTH_FAILED':
           await handleAuthFailed(message, sendResponse);
           break;
+        case 'OFFSCREEN_IDLE':
+          await closeOffscreenIfIdle(message.reason);
+          sendResponse({ success: true });
+          break;
         case 'CHUNK_RECORDED':
           await handleChunkRecorded(message, sendResponse);
           break;
@@ -279,7 +288,7 @@ async function handleStartRecording(message, sendResponse) {
 
   let targetWsUrl = data.wsUrl;
   if (!targetWsUrl || typeof targetWsUrl !== 'string' || (!targetWsUrl.startsWith('ws://') && !targetWsUrl.startsWith('wss://'))) {
-    targetWsUrl = 'ws://18.204.127.179:8001';
+    targetWsUrl = DEFAULT_WS_URL;
   }
 
   // Send start command to offscreen. email + accessKey travel in the WS auth message so the server
@@ -334,8 +343,10 @@ async function handleStopRecording(sendResponse) {
     recordingStartTime: null
   });
   
-  // Close offscreen after a delay to ensure final chunk is sent
-  setTimeout(() => closeOffscreenDocument(), 3000);
+  // Do NOT close the offscreen document yet: it may still be delivering queued video (e.g. after a
+  // connection drop) and the end marker. It reports OFFSCREEN_IDLE when done; this is only a fallback.
+  // (The old fixed 3s close also killed a NEW recording started within those 3 seconds.)
+  setTimeout(() => closeOffscreenIfIdle('fallback timeout'), OFFSCREEN_IDLE_FALLBACK_MS);
   
   sendResponse(result);
 }
@@ -477,10 +488,21 @@ async function handleScheduleLookup(message, sendResponse) {
   const apiBase = data.apiBaseUrl || DEFAULT_API_BASE;
   if (!data.userEmail) refreshUserEmail();
   const email = data.userEmail || '';
+  const query = `/api/schedules/lookup?meetingId=${encodeURIComponent(meetingId)}&email=${encodeURIComponent(email)}`;
+  const lookup = async (base) => {
+    const resp = await fetch(`${base}${query}`, { method: 'GET' });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    return resp.json();
+  };
   try {
-    const url = `${apiBase}/api/schedules/lookup?meetingId=${encodeURIComponent(meetingId)}&email=${encodeURIComponent(email)}`;
-    const resp = await fetch(url, { method: 'GET' });
-    const binding = await resp.json();
+    let binding;
+    try {
+      binding = await lookup(apiBase);
+    } catch (primaryErr) {
+      if (apiBase === LEGACY_API_BASE) throw primaryErr;
+      console.warn('[GMR] Schedule lookup via', apiBase, 'failed (' + primaryErr.message + ') — trying legacy endpoint');
+      binding = await lookup(LEGACY_API_BASE);
+    }
     const map = data.bindingByMeeting || {};
     map[meetingId] = binding;
     await chrome.storage.local.set({ bindingByMeeting: map });
@@ -761,6 +783,14 @@ async function sendToOffscreen(message) {
       resolve(response || { error: 'No response from offscreen' });
     });
   });
+}
+
+// Close the offscreen document once it has nothing left to do — never while a recording is running.
+async function closeOffscreenIfIdle(reason) {
+  const data = await chrome.storage.local.get(['isRecording']);
+  if (data.isRecording) return;
+  console.log('[GMR] Closing offscreen document:', reason);
+  try { await closeOffscreenDocument(); } catch (e) { /* already closed */ }
 }
 
 // Handle tab close while recording

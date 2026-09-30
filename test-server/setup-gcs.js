@@ -10,7 +10,7 @@ const path = require('path');
 const { Storage } = require('@google-cloud/storage');
 
 const BUCKET = process.env.GCS_BUCKET_NAME || 'meet-cloud';
-const LOCATION = process.env.GCS_LOCATION || 'ASIA-SOUTH1';
+const LOCATION = process.env.GCS_LOCATION || 'US';
 const KEY = process.env.GOOGLE_APPLICATION_CREDENTIALS || path.join(__dirname, 'Service-Account.json');
 
 (async () => {

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Google Meet Recorder",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Record Google Meet sessions, track participants, capture transcripts, and stream data via WebSocket.",
   "permissions": [
     "activeTab",

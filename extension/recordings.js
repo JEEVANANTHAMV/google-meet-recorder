@@ -10,7 +10,7 @@ document.addEventListener('DOMContentLoaded', () => {
   async function loadRecordings() {
     chrome.storage.local.get(['recordingHistory', 'wsUrl'], (data) => {
       const history = data.recordingHistory || [];
-      const wsUrl = data.wsUrl || 'ws://18.204.127.179:8001';
+      const wsUrl = data.wsUrl || 'wss://erp.lmsmybeta.com/gmr';
       const httpBaseUrl = wsUrl.replace(/^ws(s?):/, 'http$1:');
 
       renderList(history, httpBaseUrl);

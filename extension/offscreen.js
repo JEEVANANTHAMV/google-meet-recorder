@@ -2,10 +2,8 @@
 // Handles getDisplayMedia(), MediaRecorder, and WebSocket streaming
 
 let mediaRecorder = null;
-let recordedChunks = [];
 let ws = null;
 let meetingId = null;
-let wsUrl = null;
 let authToken = null;
 let userEmail = null;
 let accessKey = null;
@@ -16,12 +14,12 @@ let reconnectTimer = null;
 let heartbeatTimer = null;
 let pingTime = 0;
 let isPaused = false;
+let lastRecordingDuration = 0; // captured at Stop; recordingStartTime is cleared before onstop fires
 let stream = null;          // the stream handed to MediaRecorder (tab video + mixed audio)
 let captureStream = null;   // raw tab/display capture stream
 let micStream = null;       // local microphone (best-effort, for the local speaker's voice)
 let playbackContext = null; // AudioContext that mixes audio + replays meeting audio to the user
 let currentSessionId = null; // Backend active session ID for reconnection
-let chunkQueue = [];        // Buffer chunks during temporary socket drop
 
 // Message handler from background script
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -95,20 +93,35 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 // Start recording. Prefers chrome.tabCapture (reliable tab audio = all participants); falls
 // back to getDisplayMedia if no stream id was provided.
 async function startRecording(serverUrl, mId, token, streamId, captureMic, email, key) {
-  wsUrl = serverUrl;
-  if (!wsUrl || typeof wsUrl !== 'string' || (!wsUrl.startsWith('ws://') && !wsUrl.startsWith('wss://'))) {
-    wsUrl = 'ws://18.204.127.179:8001';
-  }
+  wsUrls = buildWsUrls(serverUrl);
+  wsUrlIndex = 0;
   meetingId = mId;
   authToken = token || null;
   userEmail = email || null;
   accessKey = key || null;
   stoppingIntentionally = false; // fresh recording: any capture-end is now an interruption
 
+  // Fresh recording: forget any previous session's connection state (this document can be reused).
+  if (savedWaitTimer) { clearTimeout(savedWaitTimer); savedWaitTimer = null; }
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+  currentSessionId = null;
+  pendingEnd = null;
+  endQueued = false;
+  reconnectAttempts = 0;
+  chunkPrep = Promise.resolve();
+  clearOutbox();
+
   console.log('[GMR Offscreen] Starting recording for meeting:', meetingId, '| tabCapture:', !!streamId, '| mic:', !!captureMic);
 
-  // Connect to WebSocket first
-  await connectWebSocket();
+  // Connect to WebSocket first (falling back to the legacy URL if the primary is unreachable).
+  try {
+    await connectWebSocket();
+  } catch (err) {
+    if (wsUrls.length < 2) throw err;
+    console.warn('[GMR Offscreen] Primary server URL failed (' + err.message + ') — trying fallback');
+    wsUrlIndex = 1;
+    await connectWebSocket();
+  }
 
   try {
     // 1) Acquire the capture stream (tab capture preferred).
@@ -199,41 +212,10 @@ async function startRecording(serverUrl, mId, token, streamId, captureMic, email
     // `stoppingIntentionally` first, so that path stops cleanly instead.
     attachCaptureEndHandler();
 
-    // Create MediaRecorder
-    const mimeType = getSupportedMimeType();
-    console.log('[GMR Offscreen] Using MIME type:', mimeType);
-    
-    mediaRecorder = new MediaRecorder(stream, {
-      mimeType: mimeType,
-      videoBitsPerSecond: 2500000,
-      audioBitsPerSecond: 128000
-    });
-    
-    // Handle data chunks
-    mediaRecorder.ondataavailable = (event) => {
-      if (event.data && event.data.size > 0) {
-        handleChunk(event.data);
-      }
-    };
-    
-    mediaRecorder.onerror = (event) => {
-      console.error('[GMR Offscreen] MediaRecorder error:', event);
-      chrome.runtime.sendMessage({
-        type: 'RECORDING_ERROR',
-        error: 'MediaRecorder error: ' + event.message
-      });
-    };
-    
-    mediaRecorder.onstop = () => {
-      console.log('[GMR Offscreen] MediaRecorder stopped');
-      sendRecordingEnd();
-    };
-    
-    // Start recording - collect chunks every 1 second
-    mediaRecorder.start(1000);
-    recordingStartTime = Date.now();
     chunkSequence = 0;
     isPaused = false;
+    startMediaRecorder();
+    recordingStartTime = Date.now();
     
     console.log('[GMR Offscreen] MediaRecorder started, state:', mediaRecorder.state);
     
@@ -255,6 +237,47 @@ async function startRecording(serverUrl, mId, token, streamId, captureMic, email
     });
     throw err;
   }
+}
+
+// Create and start a MediaRecorder on the current stream. Also used to restart recording into a new
+// server session. Callbacks of a replaced recorder are ignored via recorderGeneration.
+function startMediaRecorder() {
+  const gen = ++recorderGeneration;
+  const mimeType = getSupportedMimeType();
+  console.log('[GMR Offscreen] Using MIME type:', mimeType);
+
+  const recorder = new MediaRecorder(stream, {
+    mimeType: mimeType,
+    videoBitsPerSecond: 2500000,
+    audioBitsPerSecond: 128000
+  });
+
+  recorder.ondataavailable = (event) => {
+    if (gen !== recorderGeneration) return;
+    if (event.data && event.data.size > 0) {
+      handleChunk(event.data, gen);
+    }
+  };
+
+  recorder.onerror = (event) => {
+    if (gen !== recorderGeneration) return;
+    console.error('[GMR Offscreen] MediaRecorder error:', event);
+    chrome.runtime.sendMessage({
+      type: 'RECORDING_ERROR',
+      error: 'MediaRecorder error: ' + event.message
+    });
+  };
+
+  recorder.onstop = () => {
+    if (gen !== recorderGeneration) return;
+    console.log('[GMR Offscreen] MediaRecorder stopped');
+    queueRecordingEnd(lastRecordingDuration);
+  };
+
+  mediaRecorder = recorder;
+  // Collect chunks every 1 second
+  recorder.start(1000);
+  if (isPaused) recorder.pause();
 }
 
 // Mix capture audio (all remote participants) + microphone (local voice) into a single track,
@@ -373,9 +396,11 @@ async function stopRecording() {
 
   stoppingIntentionally = true; // any track-end from here on is part of an intentional stop
   stopDurationReporting();
+  lastRecordingDuration = recordingStartTime ? Date.now() - recordingStartTime : 0;
 
-  if (mediaRecorder && mediaRecorder.state !== 'inactive') {
-    mediaRecorder.stop();
+  const recorderWasActive = !!mediaRecorder && mediaRecorder.state !== 'inactive';
+  if (recorderWasActive) {
+    mediaRecorder.stop(); // onstop -> queueRecordingEnd(): queued chunks + end marker are still delivered
   }
 
   // Stop all tracks across every stream we opened.
@@ -392,12 +417,15 @@ async function stopRecording() {
     playbackContext = null;
   }
 
-  // Do NOT close WebSocket immediately here. It will be closed
-  // after receiving the 'recording_saved' confirmation from the server.
+  // Do NOT close the WebSocket or clear the outbox here: queued chunks and the end marker are still
+  // delivered (reconnecting with currentSessionId if needed); the socket closes on recording_saved.
 
   recordingStartTime = null;
-  currentSessionId = null;
-  chunkQueue = [];
+  if (!recorderWasActive) {
+    // The recorder had already stopped by itself (every captured track ended), so no onstop is coming.
+    if (currentSessionId) queueRecordingEnd(lastRecordingDuration);
+    else goIdle('stopped with nothing to deliver');
+  }
 
   chrome.runtime.sendMessage({
     type: 'RECORDING_STATUS',
@@ -449,80 +477,6 @@ function setMicMuted(muted) {
   }
 }
 
-// Handle recording chunk
-function handleChunk(blob) {
-  chunkSequence++;
-  const seq = chunkSequence;
-  
-  // Send via WebSocket if open, or queue during brief disconnect
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    while (chunkQueue.length > 0) {
-      const item = chunkQueue.shift();
-      sendChunkOverWebSocket(item.blob, item.seq);
-    }
-    sendChunkOverWebSocket(blob, seq);
-  } else {
-    // Buffer up to 60 chunks (~60 seconds of video) during reconnection
-    if (chunkQueue.length < 60) {
-      chunkQueue.push({ blob, seq });
-    }
-  }
-  
-  // Also notify background about chunk
-  chrome.runtime.sendMessage({
-    type: 'CHUNK_RECORDED',
-    sequence: seq,
-    size: blob.size
-  });
-}
-
-// Send chunk over WebSocket with binary protocol
-function sendChunkOverWebSocket(blob, sequence) {
-  // Protocol: [1 byte: type=0x01][4 bytes: sequence (uint32be)][8 bytes: timestamp (uint64be)][N bytes: data]
-  const timestamp = BigInt(Date.now());
-  
-  blob.arrayBuffer().then(buffer => {
-    const headerSize = 13; // 1 + 4 + 8
-    const totalSize = headerSize + buffer.byteLength;
-    const message = new ArrayBuffer(totalSize);
-    const view = new DataView(message);
-    
-    // Write header
-    view.setUint8(0, 0x01); // Message type: RECORDING_CHUNK
-    view.setUint32(1, sequence, false); // Sequence number (big-endian)
-    view.setBigUint64(5, timestamp, false); // Timestamp (big-endian)
-    
-    // Copy blob data
-    new Uint8Array(message, headerSize).set(new Uint8Array(buffer));
-    
-    ws.send(message);
-  });
-}
-
-// Send recording end message
-function sendRecordingEnd() {
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    const message = new ArrayBuffer(13);
-    const view = new DataView(message);
-    view.setUint8(0, 0x04); // Message type: RECORDING_END
-    view.setUint32(1, chunkSequence, false);
-    view.setBigUint64(5, BigInt(Date.now()), false);
-    ws.send(message);
-  }
-  
-  // Also send JSON summary
-  const duration = recordingStartTime ? Date.now() - recordingStartTime : 0;
-  sendJSONMessage({
-    type: 'recording_end',
-    meetingId: meetingId,
-    duration: duration,
-    totalChunks: chunkSequence,
-    timestamp: new Date().toISOString()
-  });
-}
-
-
-
 // Duration reporting interval
 let durationInterval = null;
 function startDurationReporting() {
@@ -545,111 +499,210 @@ function stopDurationReporting() {
   }
 }
 
-// WebSocket connection
+// ==================== SERVER CONNECTION ====================
+//
+// Everything bound for the server — video chunks and JSON events alike — goes through one ordered
+// outbox that is only drained while the socket is open AND the server has confirmed our session.
+// That gives four guarantees the old code lacked:
+//   - A socket is identified by object, and handlers of any socket that is no longer `ws` do nothing.
+//     Previously a replaced socket's onclose still scheduled a reconnect, which closed the NEW healthy
+//     socket, whose onclose scheduled another… an endless close/reopen loop every 5s ("reconnecting…"
+//     flicker on a perfectly good network).
+//   - A connection that stops answering is detected within PONG_TIMEOUT_MS instead of whenever the OS
+//     gives up on the TCP socket (minutes after a Wi-Fi blip or sleep).
+//   - Nothing is silently dropped: chunks queue while disconnected (bounded by bytes, enough to outlast
+//     the server's resume window), and after a resume the server reports the last chunk it received so
+//     anything lost in flight is resent.
+//   - If the server could not resume our session, the recorder restarts so the new file begins with a
+//     WebM header (a file that starts mid-stream is unplayable).
+
+// Fallback when the configured server URL is unreachable (e.g. the TLS endpoint isn't live yet).
+const LEGACY_WS_URL = 'ws://18.204.127.179:8001';
+// ~16 min of video at 2.5 Mbps — longer than the server's 10-minute resume window.
+const MAX_OUTBOX_BYTES = 300 * 1024 * 1024;
+const MAX_OUTBOX_JSON = 5000;
+// Chunks kept after sending so they can be resent if the socket dies before the server stores them.
+const RESEND_HISTORY = 30;
+const HEARTBEAT_MS = 10000;
+const PONG_TIMEOUT_MS = 25000;
+const CONNECT_TIMEOUT_MS = 10000;
+const MAX_RECONNECT_DELAY_MS = 15000;
+// After Stop, keep trying to deliver queued chunks + the end marker for this long.
+const END_DELIVERY_DEADLINE_MS = 15 * 60 * 1000;
+// After delivering the end marker, wait this long for recording_saved before going idle.
+const SAVED_WAIT_MS = 5 * 60 * 1000;
+// Close codes after which reconnecting is pointless: 4000 replaced by a newer connection of ours,
+// 4001 bad token, 4003 access key required.
+const NO_RECONNECT_CODES = new Set([4000, 4001, 4003]);
+
+let wsUrls = [];
+let wsUrlIndex = 0;
+let wsAuthed = false;          // server confirmed our session on the current socket
+let lastServerMsgAt = 0;
+let reconnectAttempts = 0;
+let lastAttemptOpened = true;
+let outbox = [];               // { kind: 'chunk', seq, buf } | { kind: 'json', text }
+let outboxBytes = 0;
+let outboxJson = 0;
+let droppedChunks = 0;
+let sentHistory = [];          // last RESEND_HISTORY chunk items sent on the wire
+let chunkPrep = Promise.resolve(); // keeps blob -> ArrayBuffer conversion in recording order
+let recorderGeneration = 0;    // bumps when the MediaRecorder is replaced; stale callbacks ignore themselves
+let pendingEnd = null;         // { totalChunks, duration, deadline } after Stop, until delivered
+let endQueued = false;         // the end marker for the current recording has been queued
+let savedWaitTimer = null;
+
+function buildWsUrls(configured) {
+  const primary = (typeof configured === 'string' && /^wss?:\/\//.test(configured)) ? configured : LEGACY_WS_URL;
+  return primary === LEGACY_WS_URL ? [primary] : [primary, LEGACY_WS_URL];
+}
+
+function reportWsStatus(connected, extra = {}) {
+  chrome.runtime.sendMessage({ type: 'WS_STATUS', connected, latency: 0, ...extra });
+}
+
+// Keep the socket (re)connecting while recording, or while a stopped recording still has data to deliver.
+function shouldStayConnected() {
+  if (pendingEnd) return Date.now() < pendingEnd.deadline;
+  return !!recordingStartTime && !stoppingIntentionally;
+}
+
+// Forget the current socket: detach its handlers first so its late events can't touch our state.
+function dropSocket() {
+  const old = ws;
+  ws = null;
+  wsAuthed = false;
+  stopHeartbeat();
+  if (!old) return;
+  old.onopen = old.onmessage = old.onerror = old.onclose = null;
+  try { old.close(); } catch (_) { /* ignore */ }
+}
+
 function connectWebSocket() {
   return new Promise((resolve, reject) => {
-    if (ws) {
-      closeWebSocket();
-    }
-    
+    dropSocket();
+    const url = wsUrls[wsUrlIndex] || LEGACY_WS_URL;
+    let sock;
     try {
-      ws = new WebSocket(wsUrl);
-      
-      ws.onopen = () => {
-        console.log('[GMR Offscreen] WebSocket connected');
-        
-        // Send auth message including currentSessionId, userEmail, accessKey
-        sendJSONMessage({
-          type: 'auth',
-          meetingId: meetingId,
-          sessionId: currentSessionId || undefined,
-          clientType: 'recorder',
-          token: authToken || undefined,
-          email: userEmail || undefined,
-          accessKey: accessKey || undefined
-        });
-        
-        // Start heartbeat
-        startHeartbeat();
-        
-        chrome.runtime.sendMessage({
-          type: 'WS_STATUS',
-          connected: true,
-          latency: 0
-        });
-        
-        resolve();
-      };
-      
-      ws.onclose = () => {
-        console.log('[GMR Offscreen] WebSocket closed');
-        stopHeartbeat();
-        chrome.runtime.sendMessage({
-          type: 'WS_STATUS',
-          connected: false
-        });
-        // Attempt reconnection
-        scheduleReconnect();
-      };
-      
-      ws.onerror = (err) => {
-        console.error('[GMR Offscreen] WebSocket error:', err);
-        chrome.runtime.sendMessage({
-          type: 'WS_STATUS',
-          connected: false,
-          error: 'WebSocket connection failed'
-        });
-        reject(err);
-      };
-      
-      ws.onmessage = (event) => {
-        handleWebSocketMessage(event.data);
-      };
-      
+      sock = new WebSocket(url);
     } catch (err) {
+      lastAttemptOpened = false;
       reject(err);
+      scheduleReconnect();
+      return;
     }
+    ws = sock;
+    let opened = false;
+    lastAttemptOpened = false;
+    console.log('[GMR Offscreen] Connecting to', url);
+
+    const connectTimer = setTimeout(() => {
+      if (opened || sock !== ws) return;
+      console.warn('[GMR Offscreen] WebSocket connect timed out:', url);
+      dropSocket();
+      reject(new Error('WebSocket connect timeout'));
+      handleSocketLost(null);
+    }, CONNECT_TIMEOUT_MS);
+
+    sock.onopen = () => {
+      if (sock !== ws) return;
+      opened = true;
+      lastAttemptOpened = true;
+      clearTimeout(connectTimer);
+      lastServerMsgAt = Date.now();
+      console.log('[GMR Offscreen] WebSocket connected — authenticating', currentSessionId ? `(resume ${currentSessionId})` : '');
+      // Sent directly (not via the outbox): nothing else may go out before the server knows our session.
+      sock.send(JSON.stringify({
+        type: 'auth',
+        meetingId: meetingId,
+        sessionId: currentSessionId || undefined,
+        clientType: 'recorder',
+        token: authToken || undefined,
+        email: userEmail || undefined,
+        accessKey: accessKey || undefined
+      }));
+      startHeartbeat();
+      resolve();
+    };
+
+    sock.onmessage = (event) => {
+      if (sock !== ws) return;
+      lastServerMsgAt = Date.now();
+      handleWebSocketMessage(event.data);
+    };
+
+    sock.onerror = () => {
+      if (sock !== ws) return;
+      console.warn('[GMR Offscreen] WebSocket error on', url);
+      if (!opened) {
+        clearTimeout(connectTimer);
+        reject(new Error('WebSocket connection failed'));
+      }
+    };
+
+    sock.onclose = (event) => {
+      if (sock !== ws) return; // a socket we already replaced — ignore
+      clearTimeout(connectTimer);
+      console.log('[GMR Offscreen] WebSocket closed, code:', event.code, event.reason || '');
+      if (!opened) reject(new Error('WebSocket closed before opening'));
+      ws = null;
+      handleSocketLost(event.code);
+    };
   });
 }
 
-function closeWebSocket() {
+function handleSocketLost(code) {
+  ws = null;
+  wsAuthed = false;
   stopHeartbeat();
+  reportWsStatus(false);
+  if (code != null && NO_RECONNECT_CODES.has(code)) {
+    console.warn('[GMR Offscreen] Server closed the connection with code', code, '— not reconnecting');
+    return;
+  }
+  scheduleReconnect();
+}
+
+// Intentional close (recording saved, auth refused, going idle).
+function closeWebSocket() {
   if (reconnectTimer) {
     clearTimeout(reconnectTimer);
     reconnectTimer = null;
   }
-  if (ws) {
-    ws.close();
-    ws = null;
-  }
+  const hadSocket = !!ws;
+  dropSocket();
+  if (hadSocket) reportWsStatus(false);
 }
 
 function scheduleReconnect() {
-  if (reconnectTimer) return;
-  // FIX: Do NOT reconnect if this was an intentional stop (user/meeting ended the recording).
-  // Previously, ws.onclose called scheduleReconnect() unconditionally, so stopping recording
-  // would kick off a reconnect loop if recordingStartTime hadn't been cleared yet.
-  if (stoppingIntentionally) return;
-
+  if (reconnectTimer || !shouldStayConnected()) return;
+  const delay = Math.min(1000 * 2 ** reconnectAttempts, MAX_RECONNECT_DELAY_MS) + Math.floor(Math.random() * 1000);
+  reconnectAttempts++;
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null;
-    if (recordingStartTime) {
-      console.log('[GMR Offscreen] Attempting WebSocket reconnection...');
-      connectWebSocket().catch(err => {
-        console.error('[GMR Offscreen] Reconnection failed:', err);
-      });
-    }
-  }, 5000);
+    if (!shouldStayConnected()) return;
+    // The last attempt never even opened: try the other server URL (TLS endpoint <-> legacy).
+    if (!lastAttemptOpened && wsUrls.length > 1) wsUrlIndex = (wsUrlIndex + 1) % wsUrls.length;
+    console.log('[GMR Offscreen] Reconnecting (attempt', reconnectAttempts + ')...');
+    connectWebSocket().catch(err => console.warn('[GMR Offscreen] Reconnect attempt failed:', err.message));
+  }, delay);
 }
 
-// Heartbeat
+// Our own liveness check. The server's protocol-level pings are answered by the browser invisibly,
+// so without this a dead connection could go unnoticed until the OS times out the TCP socket.
 function startHeartbeat() {
+  stopHeartbeat();
   heartbeatTimer = setInterval(() => {
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      pingTime = Date.now();
-      sendJSONMessage({ type: 'ping' });
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    if (Date.now() - lastServerMsgAt > PONG_TIMEOUT_MS) {
+      console.warn('[GMR Offscreen] No reply from server for', Math.round((Date.now() - lastServerMsgAt) / 1000), 's — treating the connection as dead');
+      dropSocket();
+      handleSocketLost(null);
+      return;
     }
-  }, 10000);
+    pingTime = Date.now();
+    ws.send(JSON.stringify({ type: 'ping' }));
+  }, HEARTBEAT_MS);
 }
 
 function stopHeartbeat() {
@@ -659,72 +712,239 @@ function stopHeartbeat() {
   }
 }
 
-function handleWebSocketMessage(data) {
-  try {
-    const message = JSON.parse(data);
-    
-    switch (message.type) {
-      case 'pong':
-        const latency = Date.now() - pingTime;
-        chrome.runtime.sendMessage({
-          type: 'WS_STATUS',
-          connected: true,
-          latency: latency
-        });
-        break;
-      case 'control':
-        if (message.action === 'stop') {
-          stopRecording();
-        }
-        break;
-      case 'recording_saved':
-        chrome.runtime.sendMessage({
-          type: 'RECORDING_SAVED',
-          downloadUrl: message.downloadUrl,
-          filename: message.filename,
-          meetingId: message.meetingId,
-          sessionId: message.sessionId
-        });
-        closeWebSocket();
-        break;
-      case 'status':
-        console.log('[GMR Offscreen] Server status:', message);
-        if (message.ok === false) {
-          // Server refused the recording (e.g. external user without a valid access key). Abort the
-          // local recording and surface a key prompt via the background worker.
-          chrome.runtime.sendMessage({
-            type: 'AUTH_FAILED',
-            code: message.code || null,
-            message: message.message || 'Recording not authorized'
-          });
-          stopRecording();
-          closeWebSocket();
-        } else if (message.ok && message.sessionId) {
-          currentSessionId = message.sessionId;
-          // Flush any buffered chunks after successful reconnection
-          while (chunkQueue.length > 0 && ws && ws.readyState === WebSocket.OPEN) {
-            const item = chunkQueue.shift();
-            sendChunkOverWebSocket(item.blob, item.seq);
-          }
-        }
-        break;
-      default:
-        // Forward to popup
-        chrome.runtime.sendMessage({
-          type: 'WS_MESSAGE',
-          data: message
-        });
+function canSend() {
+  return !!ws && ws.readyState === WebSocket.OPEN && wsAuthed;
+}
+
+function enqueue(item) {
+  if (item.kind === 'chunk') {
+    if (outboxBytes + item.buf.byteLength > MAX_OUTBOX_BYTES) {
+      if (droppedChunks++ === 0) console.error('[GMR Offscreen] Outbox full — dropping video until the server is reachable again');
+      return;
     }
+    outboxBytes += item.buf.byteLength;
+  } else {
+    if (outboxJson >= MAX_OUTBOX_JSON) return;
+    outboxJson++;
+  }
+  outbox.push(item);
+  pumpOutbox();
+}
+
+function pumpOutbox() {
+  if (!canSend()) return;
+  while (outbox.length) {
+    const item = outbox.shift();
+    if (item.kind === 'chunk') {
+      outboxBytes -= item.buf.byteLength;
+      ws.send(item.buf);
+      sentHistory.push(item);
+      if (sentHistory.length > RESEND_HISTORY) sentHistory.shift();
+    } else {
+      outboxJson--;
+      ws.send(item.text);
+    }
+  }
+  if (droppedChunks) {
+    console.warn('[GMR Offscreen] Reconnected after dropping', droppedChunks, 'chunk(s) while the outbox was full');
+    droppedChunks = 0;
+  }
+  if (pendingEnd) deliverEnd();
+}
+
+// After a resume, put back anything we sent that the server never stored (lost in flight when the
+// old socket died). These chunks are all older than whatever is still queued, so order is preserved.
+function requeueUnacked(lastSequence) {
+  const missing = sentHistory.filter(h => h.seq > lastSequence);
+  sentHistory = sentHistory.filter(h => h.seq <= lastSequence);
+  if (!missing.length) return;
+  console.log('[GMR Offscreen] Resending', missing.length, 'chunk(s) the server did not receive');
+  for (const h of missing) outboxBytes += h.buf.byteLength;
+  outbox.unshift(...missing);
+}
+
+function clearOutbox({ keepJson = false } = {}) {
+  outbox = keepJson ? outbox.filter(i => i.kind === 'json') : [];
+  outboxBytes = 0;
+  outboxJson = outbox.length;
+  sentHistory = [];
+  droppedChunks = 0;
+}
+
+// Handle recording chunk
+function handleChunk(blob, gen) {
+  chunkSequence++;
+  const seq = chunkSequence;
+  chunkPrep = chunkPrep
+    .then(() => blob.arrayBuffer())
+    .then(buffer => {
+      if (gen !== recorderGeneration) return; // from a recorder we have since replaced
+      enqueue({ kind: 'chunk', seq, buf: buildChunkMessage(seq, buffer) });
+    })
+    .catch(err => console.error('[GMR Offscreen] Failed to read recording chunk:', err));
+
+  chrome.runtime.sendMessage({
+    type: 'CHUNK_RECORDED',
+    sequence: seq,
+    size: blob.size
+  });
+}
+
+// Binary protocol: [1 byte: type=0x01][4 bytes: sequence (uint32be)][8 bytes: timestamp (uint64be)][N bytes: data]
+function buildChunkMessage(sequence, buffer) {
+  const headerSize = 13;
+  const message = new ArrayBuffer(headerSize + buffer.byteLength);
+  const view = new DataView(message);
+  view.setUint8(0, 0x01);
+  view.setUint32(1, sequence, false);
+  view.setBigUint64(5, BigInt(Date.now()), false);
+  new Uint8Array(message, headerSize).set(new Uint8Array(buffer));
+  return message;
+}
+
+// Called when the MediaRecorder has stopped: the end marker goes out only after every queued chunk
+// (including the final one the recorder emits on stop), reconnecting first if necessary.
+function queueRecordingEnd(duration) {
+  if (endQueued) return;
+  endQueued = true;
+  chunkPrep.then(() => {
+    pendingEnd = { totalChunks: chunkSequence, duration, deadline: Date.now() + END_DELIVERY_DEADLINE_MS };
+    if (canSend()) pumpOutbox();
+    else if (!ws) scheduleReconnect();
+  });
+}
+
+function deliverEnd() {
+  const end = pendingEnd;
+  pendingEnd = null;
+  const bin = new ArrayBuffer(13);
+  const view = new DataView(bin);
+  view.setUint8(0, 0x04); // Message type: RECORDING_END
+  view.setUint32(1, end.totalChunks, false);
+  view.setBigUint64(5, BigInt(Date.now()), false);
+  ws.send(bin);
+  ws.send(JSON.stringify({
+    type: 'recording_end',
+    meetingId: meetingId,
+    duration: end.duration,
+    totalChunks: end.totalChunks,
+    timestamp: new Date().toISOString()
+  }));
+  console.log('[GMR Offscreen] Recording end delivered (', end.totalChunks, 'chunks) — waiting for recording_saved');
+  // The server uploads before confirming, which can take a while for long classes.
+  if (savedWaitTimer) clearTimeout(savedWaitTimer);
+  savedWaitTimer = setTimeout(() => goIdle('recording_saved not received in time'), SAVED_WAIT_MS);
+}
+
+// Recording fully handed off (or abandoned): close the socket and let the background close this document.
+function goIdle(reason) {
+  if (savedWaitTimer) { clearTimeout(savedWaitTimer); savedWaitTimer = null; }
+  recorderGeneration++; // a recorder still stopping must not queue a new end marker
+  pendingEnd = null;
+  currentSessionId = null;
+  clearOutbox();
+  closeWebSocket();
+  console.log('[GMR Offscreen] Idle:', reason);
+  chrome.runtime.sendMessage({ type: 'OFFSCREEN_IDLE', reason });
+}
+
+function handleWebSocketMessage(data) {
+  let message;
+  try {
+    message = JSON.parse(data);
   } catch (err) {
-    // Binary or non-JSON message, ignore
+    return; // binary or non-JSON message, ignore
+  }
+
+  switch (message.type) {
+    case 'pong':
+      chrome.runtime.sendMessage({
+        type: 'WS_STATUS',
+        connected: true,
+        latency: Date.now() - pingTime
+      });
+      break;
+    case 'control':
+      if (message.action === 'stop') {
+        stopRecording();
+      }
+      break;
+    case 'recording_saved':
+      chrome.runtime.sendMessage({
+        type: 'RECORDING_SAVED',
+        downloadUrl: message.downloadUrl,
+        filename: message.filename,
+        meetingId: message.meetingId,
+        sessionId: message.sessionId
+      });
+      goIdle('recording saved');
+      break;
+    case 'status':
+      console.log('[GMR Offscreen] Server status:', message);
+      if (message.ok === false) {
+        // Server refused the recording (e.g. external user without a valid access key). Abort the
+        // local recording and surface a key prompt via the background worker.
+        chrome.runtime.sendMessage({
+          type: 'AUTH_FAILED',
+          code: message.code || null,
+          message: message.message || 'Recording not authorized'
+        });
+        stopRecording();
+        goIdle('server refused the recording');
+      } else if (message.ok && message.sessionId) {
+        handleSessionConfirmed(message);
+      }
+      break;
+    default:
+      // Forward to popup
+      chrome.runtime.sendMessage({
+        type: 'WS_MESSAGE',
+        data: message
+      });
   }
 }
 
-// Send JSON message over WebSocket
-function sendJSONMessage(data) {
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify(data));
+function handleSessionConfirmed(message) {
+  const resumed = message.reconnected === true && !!currentSessionId && message.sessionId === currentSessionId;
+  const lostSession = !!currentSessionId && !resumed;
+  currentSessionId = message.sessionId;
+  wsAuthed = true;
+  reconnectAttempts = 0;
+  reportWsStatus(true);
+
+  if (lostSession) {
+    console.warn('[GMR Offscreen] Server could not resume our session — continuing in new session', message.sessionId);
+    if (pendingEnd) {
+      // Stopped already: what we hold is the tail of a stream the new file can't use. Close the empty
+      // session straight away instead of leaving it open on the server.
+      clearOutbox({ keepJson: true });
+      pumpOutbox(); // sends queued events, then the end marker
+      return;
+    }
+    if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+      restartRecorderForNewSession();
+    }
+  } else if (resumed && typeof message.lastSequence === 'number') {
+    requeueUnacked(message.lastSequence);
   }
+  pumpOutbox();
+}
+
+// A new server session needs a stream that starts with a WebM header, which only a fresh
+// MediaRecorder produces. The queued chunks belong to the finished session and are discarded.
+function restartRecorderForNewSession() {
+  const old = mediaRecorder;
+  clearOutbox({ keepJson: true });
+  chunkSequence = 0;
+  startMediaRecorder(); // bumps recorderGeneration, so the old recorder's callbacks are ignored
+  try { if (old && old.state !== 'inactive') old.stop(); } catch (_) { /* ignore */ }
+  console.log('[GMR Offscreen] Recorder restarted for the new session');
+}
+
+// JSON events (participants, transcript). Queued like chunks so nothing is lost while reconnecting.
+function sendJSONMessage(data) {
+  if (!canSend() && !shouldStayConnected()) return; // no recording in progress
+  enqueue({ kind: 'json', text: JSON.stringify(data) });
 }
 
 // Get supported MIME type
