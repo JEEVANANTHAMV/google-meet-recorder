@@ -113,28 +113,10 @@ async function startRecording(serverUrl, mId, token, streamId, captureMic, email
 
   console.log('[GMR Offscreen] Starting recording for meeting:', meetingId, '| tabCapture:', !!streamId, '| mic:', !!captureMic);
 
-  // Connect first (falling back to the legacy URL if the primary is unreachable) and wait for the
-  // server to ACCEPT the session before capturing anything. Capturing in parallel meant a refusal
-  // (e.g. access key required) arrived mid-start and left a "recording" with nowhere to go.
   try {
-    const sessionReady = waitForSession(SESSION_CONFIRM_TIMEOUT_MS);
-    try {
-      await connectWebSocket();
-    } catch (err) {
-      if (wsUrls.length < 2) throw err;
-      console.warn('[GMR Offscreen] Primary server URL failed (' + err.message + ') — trying fallback');
-      wsUrlIndex = 1;
-      await connectWebSocket();
-    }
-    await sessionReady;
-  } catch (err) {
-    if (startWaiter) startWaiter.reject(err);
-    goIdle('could not start: ' + err.message);
-    throw err;
-  }
-
-  try {
-    // 1) Acquire the capture stream (tab capture preferred).
+    // 1) Acquire the capture stream (tab capture preferred). This happens BEFORE connecting: a
+    //    tabCapture stream id expires a few seconds after it is issued, and connecting can take
+    //    longer (e.g. the primary URL times out and we fall back).
     if (streamId) {
       captureStream = await navigator.mediaDevices.getUserMedia({
         audio: {
@@ -222,12 +204,31 @@ async function startRecording(serverUrl, mId, token, streamId, captureMic, email
     // `stoppingIntentionally` first, so that path stops cleanly instead.
     attachCaptureEndHandler();
 
+    // 4) Connect (falling back to the legacy URL if the primary is unreachable) and wait for the
+    //    server to ACCEPT the session before recording. Starting in parallel meant a refusal (e.g.
+    //    access key required) arrived mid-start and left a "recording" with nowhere to go.
+    try {
+      const sessionReady = waitForSession(SESSION_CONFIRM_TIMEOUT_MS);
+      try {
+        await connectWebSocket();
+      } catch (err) {
+        if (wsUrls.length < 2) throw err;
+        console.warn('[GMR Offscreen] Primary server URL failed (' + err.message + ') — trying fallback');
+        wsUrlIndex = 1;
+        await connectWebSocket();
+      }
+      await sessionReady;
+    } catch (err) {
+      if (startWaiter) startWaiter.reject(err);
+      err.sessionFailed = true;
+      throw err;
+    }
+
     chunkSequence = 0;
     isPaused = false;
     startMediaRecorder();
     recordingStartTime = Date.now();
-    // The socket may have dropped while the user was in the share picker (no reconnects are scheduled
-    // before recording starts). Chunks are queued meanwhile; resume the session now.
+    // If the socket dropped in the meantime, chunks are queued; resume the session now.
     if (!ws) scheduleReconnect();
     
     console.log('[GMR Offscreen] MediaRecorder started, state:', mediaRecorder.state);
@@ -244,12 +245,16 @@ async function startRecording(serverUrl, mId, token, streamId, captureMic, email
     
   } catch (err) {
     console.error('[GMR Offscreen] Failed to start recording:', err);
-    [captureStream, micStream].forEach(s => { if (s) s.getTracks().forEach(t => t.stop()); });
-    abandonSession('capture failed: ' + err.message);
-    chrome.runtime.sendMessage({
-      type: 'RECORDING_ERROR',
-      error: 'Failed to start recording: ' + err.message
-    });
+    releaseCapture();
+    abandonSession((err.sessionFailed ? 'server session failed: ' : 'capture failed: ') + err.message);
+    // A refusal was already reported as AUTH_FAILED (key prompt); don't add an error toast on top.
+    if (!err.sessionFailed || !startRefused) {
+      chrome.runtime.sendMessage({
+        type: 'RECORDING_ERROR',
+        error: 'Failed to start recording: ' + err.message
+      });
+    }
+    startRefused = false;
     throw err;
   }
 }
@@ -293,6 +298,21 @@ function startMediaRecorder() {
   // Collect chunks every 1 second
   recorder.start(1000);
   if (isPaused) recorder.pause();
+}
+
+// Release everything a failed start acquired (capture, mic, audio graph) without the capture-end
+// handler treating it as an interruption.
+function releaseCapture() {
+  const vTrack = captureStream && captureStream.getVideoTracks()[0];
+  if (vTrack) vTrack.onended = null;
+  [stream, captureStream, micStream].forEach(s => { if (s) s.getTracks().forEach(t => t.stop()); });
+  stream = null;
+  captureStream = null;
+  micStream = null;
+  if (playbackContext) {
+    try { playbackContext.close(); } catch (e) { /* ignore */ }
+    playbackContext = null;
+  }
 }
 
 // Mix capture audio (all remote participants) + microphone (local voice) into a single track,
@@ -577,6 +597,7 @@ let pendingEnd = null;         // { totalChunks, duration, deadline } after Stop
 let endQueued = false;         // the end marker for the current recording has been queued
 let savedWaitTimer = null;
 let startWaiter = null;        // { resolve, reject } while startRecording awaits the server's verdict
+let startRefused = false;       // the pending start was refused by the server (already reported as AUTH_FAILED)
 let pumpTimer = null;
 let sockBytesQueued = 0;       // bytes handed to the current socket
 let lastDrained = 0;           // bytes the current socket had actually pushed out at the last heartbeat
@@ -973,7 +994,8 @@ function handleWebSocketMessage(data) {
           message: message.message || 'Recording not authorized'
         });
         if (startWaiter) {
-          // Still starting: nothing captured yet; startRecording() fails and cleans up.
+          // Still starting: the recorder hasn't started; startRecording() fails and cleans up.
+          startRefused = true;
           startWaiter.reject(new Error(message.message || 'Recording not authorized'));
           return;
         }
