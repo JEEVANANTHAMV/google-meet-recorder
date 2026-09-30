@@ -64,17 +64,26 @@ function createScheduleRegistry(storage, config, logger) {
     };
   }
 
-  async function persistNow() {
-    dirty = false;
-    try {
-      await storage.writeJSON(REGISTRY_MEETING, REGISTRY_SESSION, REGISTRY_FILE, {
-        version: 1,
-        updatedAt: new Date().toISOString(),
-        occurrences: Array.from(registry.values())
-      });
-    } catch (err) {
-      logger.error({ err: err.message }, 'Failed to persist schedule registry');
-    }
+  // Writes are serialised (GCS allows ~1 mutation/sec per object; overlapping writes hit the rate
+  // limit) and a failed write re-marks the registry dirty so the change is retried, not lost.
+  let persistChain = Promise.resolve();
+  function persistNow() {
+    persistChain = persistChain.then(async () => {
+      if (!dirty) return;
+      dirty = false;
+      try {
+        await storage.writeJSON(REGISTRY_MEETING, REGISTRY_SESSION, REGISTRY_FILE, {
+          version: 1,
+          updatedAt: new Date().toISOString(),
+          occurrences: Array.from(registry.values())
+        });
+      } catch (err) {
+        dirty = true;
+        logger.error({ err: err.message }, 'Failed to persist schedule registry — will retry');
+        scheduleSave();
+      }
+    });
+    return persistChain;
   }
 
   function scheduleSave() {
@@ -83,7 +92,7 @@ function createScheduleRegistry(storage, config, logger) {
     saveTimer = setTimeout(async () => {
       saveTimer = null;
       if (dirty) await persistNow();
-    }, 1500);
+    }, 3000);
   }
 
   return {

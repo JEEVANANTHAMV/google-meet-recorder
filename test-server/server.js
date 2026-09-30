@@ -36,7 +36,9 @@ const CONFIG = {
   signedUrlExpiresDays: parseInt(process.env.SIGNED_URL_EXPIRES_DAYS || '7', 10),
   selfCheck: process.env.STORAGE_SELFCHECK !== 'false',
   // WS hardening
-  maxPayloadBytes: parseInt(process.env.WS_MAX_PAYLOAD_MB || '16', 10) * 1024 * 1024,
+  // Chrome occasionally emits one oversized recording chunk (e.g. after the machine stalls); a limit
+  // below that drops the recorder mid-class. The extension never sends a single chunk over 100 MB.
+  maxPayloadBytes: parseInt(process.env.WS_MAX_PAYLOAD_MB || '128', 10) * 1024 * 1024,
   allowedOrigins: (process.env.WS_ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean),
   authToken: process.env.AUTH_TOKEN || '',
   heartbeatIntervalMs: parseInt(process.env.WS_HEARTBEAT_MS || '15000', 10),
@@ -226,6 +228,7 @@ function stateFromSession(session) {
     email: session.email,
     authReason: session.authReason,
     finalized: session.finalized,
+    uploaded: !!session.uploaded,
     notified: !!session.notified
   };
 }
@@ -266,31 +269,41 @@ async function flushSession(session, { force = false } = {}) {
   if (force || session.dirty.participants || session.dirty.transcript || session.dirty.meta) {
     await persistState(session);
   }
-  try {
-    if (force || session.dirty.participants) {
-      session.dirty.participants = false;
-      await storage.writeJSON(session.meetingId, session.id, 'participants.json', {
-        meetingId: session.meetingId,
-        sessionId: session.id,
-        events: session.participants,
-        roster: buildRoster(session.participants)
-      });
+  // Each artifact is written independently; one that fails is marked dirty again so it is retried
+  // (previously a failed write was simply dropped until the next change).
+  const writes = [
+    ['participants', 'participants.json', () => ({
+      meetingId: session.meetingId, sessionId: session.id,
+      events: session.participants, roster: buildRoster(session.participants)
+    })],
+    ['transcript', 'transcript.json', () => ({
+      meetingId: session.meetingId, sessionId: session.id, lines: session.transcript
+    })],
+    ['meta', 'meta.json', () => metaFromSession(session)]
+  ];
+  let ok = true;
+  for (const [key, file, body] of writes) {
+    if (!force && !session.dirty[key]) continue;
+    session.dirty[key] = false;
+    try {
+      await storage.writeJSON(session.meetingId, session.id, file, body());
+    } catch (err) {
+      ok = false;
+      session.dirty[key] = true;
+      logger.error({ err: err.message, sessionId: session.id, file }, 'Failed to flush session artifact — will retry');
     }
-    if (force || session.dirty.transcript) {
-      session.dirty.transcript = false;
-      await storage.writeJSON(session.meetingId, session.id, 'transcript.json', {
-        meetingId: session.meetingId,
-        sessionId: session.id,
-        lines: session.transcript
-      });
-    }
-    if (force || session.dirty.meta) {
-      session.dirty.meta = false;
-      await storage.writeJSON(session.meetingId, session.id, 'meta.json', metaFromSession(session));
-    }
-  } catch (err) {
-    logger.error({ err: err.message, sessionId: session.id }, 'Failed to flush session artifacts');
   }
+  if (!ok && !session.finalized) scheduleFlush(session);
+  return ok;
+}
+
+// Final artifact write for an ending session, with a few quick retries.
+async function flushSessionReliably(session) {
+  for (let attempt = 1; attempt <= 4; attempt++) {
+    if (await flushSession(session, { force: true })) return true;
+    if (attempt < 4) await sleep(2000 * 3 ** (attempt - 1));
+  }
+  return false;
 }
 
 function scheduleFlush(session) {
@@ -392,20 +405,24 @@ async function completeSession(session, reason) {
   if (completingSessions.has(session.id)) return;
   completingSessions.add(session.id);
   try {
-    const uploaded = await uploadSpooledRecording(session);
-    if (!uploaded) {
-      session.state = 'upload_pending';
-      session.dirty.meta = true;
-      await flushSession(session, { force: true });
-      detachSession(session);
-      logger.error({ sessionId: session.id, spool: spoolDirFor(session.meetingId, session.id) },
-        'Recording upload still failing — kept in spool, retry sweep will try again');
-      return;
+    if (!session.uploaded) {
+      const uploaded = await uploadSpooledRecording(session);
+      if (!uploaded) {
+        session.state = 'upload_pending';
+        session.dirty.meta = true;
+        await flushSession(session, { force: true });
+        detachSession(session);
+        logger.error({ sessionId: session.id, spool: spoolDirFor(session.meetingId, session.id) },
+          'Recording upload still failing — kept in spool, retry sweep will try again');
+        return;
+      }
+      session.uploaded = true;
+      await persistState(session); // a retry after this point must not upload again
     }
 
     session.state = session.recordingError && session.chunkCount === 0 ? 'error' : 'ended';
     session.dirty.meta = true;
-    await flushSession(session, { force: true });
+    const saved = await flushSessionReliably(session);
     detachSession(session);
 
     logger.info({
@@ -417,10 +434,20 @@ async function completeSession(session, reason) {
     }, 'Session finalized');
 
     // Link + push to the ERP whenever the session captured anything meaningful.
+    let pushed = false;
     try {
-      await pushSessionToBackend(session);
+      pushed = await pushSessionToBackend(session);
     } catch (err) {
       logger.error({ err: err.message, sessionId: session.id }, 'Backend push failed');
+    }
+
+    if (!saved || !pushed) {
+      // Keep the spool (state.json carries the transcript/participants) so the retry sweep can finish
+      // the job — previously a failed ERP push was never retried and the class never reached the ERP.
+      await persistState(session);
+      logger.error({ sessionId: session.id, artifactsSaved: saved, pushedToErp: pushed },
+        'Session not fully published — kept in spool, retry sweep will try again');
+      return;
     }
 
     session.spoolRemoved = true;
@@ -434,10 +461,9 @@ async function completeSession(session, reason) {
 
 // Match the session to its scheduled occurrence and push the full result to the ERP webhook.
 async function pushSessionToBackend(session) {
-  if (session.notified) return;
+  if (session.notified) return true;
   const hasData = session.chunkCount > 0 || session.participants.length > 0 || session.transcript.length > 0;
-  if (!hasData) return;
-  session.notified = true;
+  if (!hasData || !backendNotifier.enabled) return true;
 
   const occ = registry.markRecorded(session.meetingId, session.id, session.startedAt);
 
@@ -450,15 +476,30 @@ async function pushSessionToBackend(session) {
     }
   }
 
-  await backendNotifier.notifySessionComplete({
-    session,
-    occ,
-    recordingObject: session.chunkCount > 0 ? objectPath(session.meetingId, session.id, 'recording.webm') : null,
-    bucket: storage.bucketName,
-    signedUrl,
-    roster: buildRoster(session.participants),
-    transcript: session.transcript
-  });
+  const PUSH_ATTEMPTS = 4;
+  for (let attempt = 1; attempt <= PUSH_ATTEMPTS; attempt++) {
+    const res = await backendNotifier.notifySessionComplete({
+      session,
+      occ,
+      recordingObject: session.chunkCount > 0 ? objectPath(session.meetingId, session.id, 'recording.webm') : null,
+      bucket: storage.bucketName,
+      signedUrl,
+      roster: buildRoster(session.participants),
+      transcript: session.transcript
+    });
+    if (res.sent) {
+      session.notified = true;
+      return true;
+    }
+    // A 4xx (other than timeout / rate limit) means the ERP rejects this payload; retrying won't help.
+    if (res.status >= 400 && res.status < 500 && res.status !== 408 && res.status !== 429) {
+      logger.error({ sessionId: session.id, status: res.status }, 'ERP rejected the session push — not retrying');
+      session.notified = true;
+      return true;
+    }
+    if (attempt < PUSH_ATTEMPTS) await sleep(10000 * 3 ** (attempt - 1));
+  }
+  return false;
 }
 
 // Rebuild an in-memory session from its spooled state.json (after a restart / for the retry sweep).
@@ -480,6 +521,7 @@ function sessionFromState(st, bytes) {
     recordingError: st.recordingError || null,
     finalized: !!st.finalized,
     notified: !!st.notified,
+    uploaded: !!st.uploaded,
     flushTimer: null,
     disconnectTimer: null,
     dirty: { participants: false, transcript: false, meta: true },
