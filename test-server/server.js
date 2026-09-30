@@ -41,7 +41,15 @@ const CONFIG = {
   authToken: process.env.AUTH_TOKEN || '',
   heartbeatIntervalMs: parseInt(process.env.WS_HEARTBEAT_MS || '15000', 10),
   flushIntervalMs: parseInt(process.env.EVENT_FLUSH_MS || '5000', 10),
-  disconnectGraceMs: parseInt(process.env.DISCONNECT_GRACE_MS || '15000', 10),
+  // How long a recording stays open after its socket drops, waiting for the same recorder to reconnect
+  // and continue the SAME file. This was 15s, but the client only notices a dead socket after tens of
+  // seconds (and retries every 5s), so any real network blip outlived it and every reconnect started a
+  // new recording. A recorder that truly ends sends recording_end, so this only delays crashed clients.
+  disconnectGraceMs: parseInt(process.env.DISCONNECT_GRACE_MS || '600000', 10),
+  // Recordings are spooled to local disk while live and uploaded to storage once the session ends.
+  spoolDir: path.resolve(process.env.SPOOL_DIR || path.join(__dirname, 'spool')),
+  uploadAttempts: parseInt(process.env.UPLOAD_ATTEMPTS || '5', 10),
+  uploadRetryIntervalMs: parseInt(process.env.UPLOAD_RETRY_INTERVAL_MS || '600000', 10),
   corsOrigin: process.env.CORS_ORIGIN || '*',
 
   // ---- Domain binding / access control ----
@@ -86,10 +94,11 @@ const registry = createScheduleRegistry(storage, CONFIG, logger);
 const mailer = createMailer(CONFIG);
 const backendNotifier = createBackendNotifier(CONFIG);
 
-// Active sessions, keyed by sessionId, plus lookups by socket and by meeting.
+// Active sessions, keyed by sessionId, plus a lookup by socket. A session stays here from auth until
+// its recording has been uploaded (or handed to the upload retry sweep).
 const sessions = new Map();        // sessionId -> session
 const sessionByWs = new Map();     // ws -> session
-const recordingByMeeting = new Map(); // meetingId -> sessionId (currently-open recorder)
+const completingSessions = new Set(); // sessionIds whose upload/finalize pipeline is running
 
 const startedAtServer = Date.now();
 
@@ -180,7 +189,83 @@ function metaFromSession(session) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Local spool
+//
+// While a session is live its recording is appended to a local file and its state (transcript,
+// participants, counters) is mirrored to state.json next to it:
+//   {spoolDir}/{meetingId}/{sessionId}/recording.webm
+//   {spoolDir}/{meetingId}/{sessionId}/state.json
+//
+// This replaces streaming chunks straight into a GCS resumable upload, which caused the "connection
+// lost — reconnecting" drops: when the upload fell behind, the socket was paused, a paused socket
+// stops reading the client's heartbeat pongs, and the heartbeat then terminated the recorder. Local
+// disk keeps up with any number of meetings, survives a server restart, and the upload at the end
+// can be retried without losing anything.
+// ---------------------------------------------------------------------------
+function spoolDirFor(meetingId, sessionId) {
+  return path.join(CONFIG.spoolDir, safeSegment(meetingId), safeSegment(sessionId));
+}
+function spoolRecordingPath(session) { return path.join(spoolDirFor(session.meetingId, session.id), 'recording.webm'); }
+function spoolStatePath(session) { return path.join(spoolDirFor(session.meetingId, session.id), 'state.json'); }
+
+function stateFromSession(session) {
+  return {
+    version: 1,
+    id: session.id,
+    meetingId: session.meetingId,
+    clientType: session.clientType,
+    startedAt: session.startedAt,
+    endedAt: session.endedAt,
+    startTimeMs: session.startTimeMs,
+    chunkCount: session.chunkCount,
+    lastSequence: session.lastSequence,
+    participants: session.participants,
+    transcript: session.transcript,
+    recordingError: session.recordingError,
+    email: session.email,
+    authReason: session.authReason,
+    finalized: session.finalized,
+    notified: !!session.notified
+  };
+}
+
+// Serialised per session (writes chain) and atomic (tmp + rename) so a crash never leaves a torn file.
+function persistState(session) {
+  if (session.spoolRemoved) return Promise.resolve();
+  const statePath = spoolStatePath(session);
+  const body = JSON.stringify(stateFromSession(session));
+  session.persistChain = (session.persistChain || Promise.resolve()).then(async () => {
+    if (session.spoolRemoved) return;
+    await fs.promises.mkdir(path.dirname(statePath), { recursive: true });
+    const tmp = `${statePath}.tmp`;
+    await fs.promises.writeFile(tmp, body);
+    await fs.promises.rename(tmp, statePath);
+  }).catch(err => {
+    logger.error({ err: err.message, sessionId: session.id }, 'Failed to persist session state to spool');
+  });
+  return session.persistChain;
+}
+
+function openSpoolStream(session) {
+  fs.mkdirSync(spoolDirFor(session.meetingId, session.id), { recursive: true });
+  const stream = fs.createWriteStream(spoolRecordingPath(session), { flags: 'a' });
+  stream.on('error', (err) => {
+    session.recordingError = err.message;
+    if (session.recordingStream === stream) session.recordingStream = null; // next chunk reopens (append)
+    logger.error({ err: err.message, sessionId: session.id }, 'Spool write error — will reopen on next chunk');
+  });
+  session.recordingStream = stream;
+  logger.info({ sessionId: session.id, file: spoolRecordingPath(session), resumed: session.bytes > 0 },
+    'Recording spool opened');
+}
+
 async function flushSession(session, { force = false } = {}) {
+  // Local spool state first: it is fast and is what restores the session after a restart, so it must
+  // not wait behind (or be lost to) a slow storage write.
+  if (force || session.dirty.participants || session.dirty.transcript || session.dirty.meta) {
+    await persistState(session);
+  }
   try {
     if (force || session.dirty.participants) {
       session.dirty.participants = false;
@@ -216,19 +301,51 @@ function scheduleFlush(session) {
   }, CONFIG.flushIntervalMs);
 }
 
-// End the recording stream and wait for the upload to finalize.
+// Close the spool file and wait until every buffered chunk is on disk.
 function endRecordingStream(session) {
   return new Promise((resolve) => {
     if (!session.recordingStream) return resolve();
     const stream = session.recordingStream;
     session.recordingStream = null;
-    stream.end();
     stream.once('finish', resolve);
     stream.once('error', (err) => {
-      logger.error({ err: err.message, sessionId: session.id }, 'Recording stream error on finalize');
+      logger.error({ err: err.message, sessionId: session.id }, 'Spool stream error on finalize');
       resolve();
     });
+    stream.end();
   });
+}
+
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+// Upload the spooled recording to storage, retrying with backoff. Returns true when there is nothing
+// (more) to upload, false when every attempt failed (the spool is kept for the retry sweep).
+async function uploadSpooledRecording(session) {
+  if (session.chunkCount === 0) return true;
+  const file = spoolRecordingPath(session);
+  if (!fs.existsSync(file)) {
+    logger.error({ sessionId: session.id }, 'Spooled recording missing — nothing to upload');
+    session.recordingError = session.recordingError || 'Spooled recording file missing';
+    return true;
+  }
+  for (let attempt = 1; attempt <= CONFIG.uploadAttempts; attempt++) {
+    try {
+      const started = Date.now();
+      await storage.uploadRecordingFile(session.meetingId, session.id, file);
+      logger.info({ sessionId: session.id, attempt, mb: (session.bytes / 1048576).toFixed(2),
+        sec: ((Date.now() - started) / 1000).toFixed(1) }, 'Recording uploaded');
+      return true;
+    } catch (err) {
+      logger.error({ err: err.message, sessionId: session.id, attempt }, 'Recording upload failed');
+      if (attempt < CONFIG.uploadAttempts) await sleep(Math.min(5000 * 3 ** (attempt - 1), 120000));
+    }
+  }
+  return false;
+}
+
+function detachSession(session) {
+  sessions.delete(session.id);
+  if (session.ws) sessionByWs.delete(session.ws);
 }
 
 async function finalizeSession(session, reason) {
@@ -262,27 +379,57 @@ async function finalizeSession(session, reason) {
       'Synthesized leave events at session end (call ended for all)');
   }
 
-  session.state = session.recordingError ? 'error' : 'ended';
+  session.state = 'uploading';
   session.dirty.meta = true;
-  await flushSession(session, { force: true });
+  await flushSession(session, { force: true }); // also records finalized:true in the spool state
 
-  if (recordingByMeeting.get(session.meetingId) === session.id) {
-    recordingByMeeting.delete(session.meetingId);
+  await completeSession(session, reason);
+}
+
+// Upload + publish a finalized session, then clean up its spool. Also used by the retry sweep and
+// startup recovery for sessions whose upload failed or was interrupted by a restart.
+async function completeSession(session, reason) {
+  if (completingSessions.has(session.id)) return;
+  completingSessions.add(session.id);
+  try {
+    const uploaded = await uploadSpooledRecording(session);
+    if (!uploaded) {
+      session.state = 'upload_pending';
+      session.dirty.meta = true;
+      await flushSession(session, { force: true });
+      detachSession(session);
+      logger.error({ sessionId: session.id, spool: spoolDirFor(session.meetingId, session.id) },
+        'Recording upload still failing — kept in spool, retry sweep will try again');
+      return;
+    }
+
+    session.state = session.recordingError && session.chunkCount === 0 ? 'error' : 'ended';
+    session.dirty.meta = true;
+    await flushSession(session, { force: true });
+    detachSession(session);
+
+    logger.info({
+      sessionId: session.id, meetingId: session.meetingId, reason,
+      chunks: session.chunkCount, bytes: session.bytes,
+      participants: distinctParticipantCount(session.participants),
+      transcriptLines: session.transcript.length,
+      durationSec: ((new Date(session.endedAt).getTime() - session.startTimeMs) / 1000).toFixed(1)
+    }, 'Session finalized');
+
+    // Link + push to the ERP whenever the session captured anything meaningful.
+    try {
+      await pushSessionToBackend(session);
+    } catch (err) {
+      logger.error({ err: err.message, sessionId: session.id }, 'Backend push failed');
+    }
+
+    session.spoolRemoved = true;
+    await (session.persistChain || Promise.resolve());
+    await fs.promises.rm(spoolDirFor(session.meetingId, session.id), { recursive: true, force: true })
+      .catch(err => logger.warn({ err: err.message, sessionId: session.id }, 'Could not remove spool dir'));
+  } finally {
+    completingSessions.delete(session.id);
   }
-  sessions.delete(session.id);
-  if (session.ws) sessionByWs.delete(session.ws);
-
-  logger.info({
-    sessionId: session.id, meetingId: session.meetingId, reason,
-    chunks: session.chunkCount, bytes: session.bytes,
-    participants: distinctParticipantCount(session.participants),
-    transcriptLines: session.transcript.length,
-    durationSec: ((Date.now() - session.startTimeMs) / 1000).toFixed(1)
-  }, 'Session finalized');
-
-  // Link + push to the ERP (fire-and-forget) whenever the session captured anything meaningful.
-  pushSessionToBackend(session).catch(err =>
-    logger.error({ err: err.message, sessionId: session.id }, 'Backend push failed'));
 }
 
 // Match the session to its scheduled occurrence and push the full result to the ERP webhook.
@@ -312,6 +459,100 @@ async function pushSessionToBackend(session) {
     roster: buildRoster(session.participants),
     transcript: session.transcript
   });
+}
+
+// Rebuild an in-memory session from its spooled state.json (after a restart / for the retry sweep).
+function sessionFromState(st, bytes) {
+  return {
+    id: st.id,
+    meetingId: st.meetingId,
+    clientType: st.clientType || 'recorder',
+    state: st.finalized ? 'uploading' : 'disconnected',
+    startedAt: st.startedAt,
+    endedAt: st.endedAt || null,
+    startTimeMs: st.startTimeMs || new Date(st.startedAt).getTime(),
+    chunkCount: st.chunkCount || 0,
+    lastSequence: st.lastSequence || 0,
+    bytes,
+    participants: st.participants || [],
+    transcript: st.transcript || [],
+    recordingStream: null,
+    recordingError: st.recordingError || null,
+    finalized: !!st.finalized,
+    notified: !!st.notified,
+    flushTimer: null,
+    disconnectTimer: null,
+    dirty: { participants: false, transcript: false, meta: true },
+    ws: null,
+    remoteAddress: null,
+    email: st.email || null,
+    authReason: st.authReason || null
+  };
+}
+
+async function readSpooledStates() {
+  const out = [];
+  let meetings = [];
+  try { meetings = await fs.promises.readdir(CONFIG.spoolDir, { withFileTypes: true }); } catch (_) { return out; }
+  for (const m of meetings) {
+    if (!m.isDirectory()) continue;
+    let sessionDirs = [];
+    try { sessionDirs = await fs.promises.readdir(path.join(CONFIG.spoolDir, m.name), { withFileTypes: true }); } catch (_) { continue; }
+    for (const d of sessionDirs) {
+      if (!d.isDirectory()) continue;
+      const dir = path.join(CONFIG.spoolDir, m.name, d.name);
+      try {
+        const st = JSON.parse(await fs.promises.readFile(path.join(dir, 'state.json'), 'utf8'));
+        let bytes = 0;
+        try { bytes = (await fs.promises.stat(path.join(dir, 'recording.webm'))).size; } catch (_) { /* no video */ }
+        out.push({ st, bytes, dir });
+      } catch (err) {
+        logger.error({ err: err.message, dir }, 'Unreadable spool entry — left in place for manual recovery');
+      }
+    }
+  }
+  return out;
+}
+
+// On startup: sessions that were live when the server stopped come back as "disconnected" so their
+// recorders can reconnect and keep writing the same file; sessions that had already ended resume
+// their upload.
+async function recoverSpooledSessions() {
+  const entries = await readSpooledStates();
+  for (const { st, bytes } of entries) {
+    const session = sessionFromState(st, bytes);
+    if (session.finalized) {
+      logger.info({ sessionId: session.id, meetingId: session.meetingId }, 'Resuming upload of ended session from spool');
+      completeSession(session, 'recovered').catch(err =>
+        logger.error({ err: err.message, sessionId: session.id }, 'Recovered upload failed'));
+      continue;
+    }
+    sessions.set(session.id, session);
+    armDisconnectTimer(session);
+    logger.info({ sessionId: session.id, meetingId: session.meetingId, mb: (bytes / 1048576).toFixed(2) },
+      'Restored live session from spool — waiting for recorder to reconnect');
+  }
+}
+
+// Periodically retry uploads that exhausted their attempts (e.g. a long storage outage).
+async function retryPendingUploads() {
+  const entries = await readSpooledStates();
+  for (const { st, bytes } of entries) {
+    if (!st.finalized || completingSessions.has(st.id) || sessions.has(st.id)) continue;
+    logger.info({ sessionId: st.id }, 'Retrying pending recording upload');
+    await completeSession(sessionFromState(st, bytes), 'upload_retry').catch(err =>
+      logger.error({ err: err.message, sessionId: st.id }, 'Upload retry failed'));
+  }
+}
+
+// Start (or restart) the countdown after which a disconnected session is finalized.
+function armDisconnectTimer(session) {
+  if (session.disconnectTimer) clearTimeout(session.disconnectTimer);
+  session.disconnectTimer = setTimeout(() => {
+    session.disconnectTimer = null;
+    logger.info({ sessionId: session.id }, 'Disconnect grace period expired, finalizing session');
+    finalizeSession(session, 'socket_close');
+  }, CONFIG.disconnectGraceMs);
 }
 
 // ---------------------------------------------------------------------------
@@ -348,35 +589,51 @@ function handleAuth(message, ws, remoteAddress) {
   const meetingId = safeSegment(message.meetingId || 'unknown');
   const clientType = message.clientType || 'recorder';
 
-  // Domain-binding / session takeover (recorders only).
+  // Domain-binding / session resume (recorders only).
   if (clientType === 'recorder') {
-    // Session takeover & seamless reconnection:
-    // If a session for this meeting already exists, re-attach to the ongoing session.
-    if (recordingByMeeting.has(meetingId)) {
-      const existingId = recordingByMeeting.get(meetingId);
-      const existing = sessions.get(existingId);
-      if (existing && !existing.finalized) {
-        if (existing.disconnectTimer) {
-          clearTimeout(existing.disconnectTimer);
-          existing.disconnectTimer = null;
-        }
-        if (existing.ws && existing.ws !== ws) {
-          const oldWs = existing.ws;
-          sessionByWs.delete(oldWs);
-          try { oldWs.close(4000, 'Replaced by new connection'); } catch (e) { /* ignore */ }
-        }
-        existing.ws = ws;
-        existing.remoteAddress = remoteAddress;
-        existing.state = 'recording';
-        sessionByWs.set(ws, existing);
-
-        logger.info({ sessionId: existing.id, meetingId, clientType, remoteAddress }, 'Session re-attached / resumed for single-file meeting recording');
-
-        ws.send(JSON.stringify({
-          type: 'status', ok: true, message: 'Authenticated', sessionId: existing.id, meetingId, reconnected: true
-        }));
-        return;
+    // Seamless reconnection: a recorder that already has a session sends its sessionId back on every
+    // reconnect, so re-attach it and keep appending to the SAME recording file.
+    //
+    // Only an explicit sessionId match re-attaches. Previously ANY recorder for the same meeting
+    // took over the open session and closed the other socket, so two people recording one class
+    // knocked each other off every 5s (each reconnect kicked the other) and both video streams were
+    // interleaved into one corrupt file. A second recorder now gets its own session instead.
+    const requested = message.sessionId ? sessions.get(safeSegment(message.sessionId)) : null;
+    if (requested && !requested.finalized && requested.meetingId === meetingId && requested.clientType === 'recorder') {
+      if (requested.disconnectTimer) {
+        clearTimeout(requested.disconnectTimer);
+        requested.disconnectTimer = null;
       }
+      if (requested.ws && requested.ws !== ws) {
+        // Same recorder's previous (stale / half-open) socket.
+        const oldWs = requested.ws;
+        sessionByWs.delete(oldWs);
+        try { oldWs.close(4000, 'Replaced by new connection'); } catch (e) { /* ignore */ }
+      }
+      requested.ws = ws;
+      requested.remoteAddress = remoteAddress;
+      requested.state = 'recording';
+      requested.dirty.meta = true;
+      scheduleFlush(requested);
+      sessionByWs.set(ws, requested);
+
+      logger.info({ sessionId: requested.id, meetingId, clientType, remoteAddress, lastSequence: requested.lastSequence },
+        'Session re-attached / resumed for single-file meeting recording');
+
+      ws.send(JSON.stringify({
+        type: 'status', ok: true, message: 'Authenticated', sessionId: requested.id, meetingId, reconnected: true
+      }));
+      return;
+    }
+    if (message.sessionId) {
+      logger.warn({ meetingId, requestedSessionId: message.sessionId, remoteAddress },
+        'Recorder asked to resume a session that is no longer open — starting a new session');
+    }
+    const parallel = Array.from(sessions.values()).filter(s =>
+      s.meetingId === meetingId && s.clientType === 'recorder' && !s.finalized);
+    if (parallel.length) {
+      logger.info({ meetingId, email: message.email, otherSessions: parallel.map(s => s.id) },
+        'Another recorder is already recording this meeting — starting a parallel session');
     }
 
     // New session: enforce domain-binding / external-key gate.
@@ -402,6 +659,7 @@ function handleAuth(message, ws, remoteAddress) {
     endedAt: null,
     startTimeMs: Date.now(),
     chunkCount: 0,
+    lastSequence: 0,
     bytes: 0,
     participants: [],
     transcript: [],
@@ -409,6 +667,7 @@ function handleAuth(message, ws, remoteAddress) {
     recordingError: null,
     finalized: false,
     flushTimer: null,
+    disconnectTimer: null,
     dirty: { participants: false, transcript: false, meta: true },
     ws,
     remoteAddress,
@@ -418,7 +677,6 @@ function handleAuth(message, ws, remoteAddress) {
 
   sessions.set(session.id, session);
   sessionByWs.set(ws, session);
-  if (clientType === 'recorder') recordingByMeeting.set(meetingId, session.id);
 
   // Persist initial meta so the meeting shows up immediately and survives a crash.
   flushSession(session, { force: true });
@@ -431,42 +689,28 @@ function handleAuth(message, ws, remoteAddress) {
 }
 
 function handleRecordingChunk(session, sequence, timestamp, data) {
-  if (!session) return;
-  // If the previous stream errored (e.g. GCS 408 timeout), destroy it and open a fresh one.
-  // Without this, every subsequent chunk writes to a dead stream and is silently dropped.
-  if (session.recordingStream && session.recordingError) {
-    try { session.recordingStream.destroy(); } catch (_) {}
-    session.recordingStream = null;
-    session.recordingError = null;
-    logger.info({ sessionId: session.id }, 'Reopening recording stream after previous error');
+  if (!session || session.finalized) return;
+  // The client numbers chunks 1..N for the life of its MediaRecorder and resends nothing, so a
+  // sequence we've already written can only be a duplicate — appending it would corrupt the WebM.
+  if (sequence <= session.lastSequence) {
+    logger.warn({ sessionId: session.id, sequence, lastSequence: session.lastSequence }, 'Dropped out-of-order/duplicate chunk');
+    return;
   }
-  if (!session.recordingStream) {
-    const isAppend = session.bytes > 0;
-    session.recordingStream = storage.createRecordingWriteStream(session.meetingId, session.id, { append: isAppend });
-    session.recordingStream.on('error', (err) => {
-      session.recordingError = err.message;
-      // Null the stream immediately so the NEXT chunk triggers a fresh open.
-      session.recordingStream = null;
-      logger.error({ err: err.message, sessionId: session.id }, 'Recording upload stream error — will retry on next chunk');
-    });
-    logger.info({ sessionId: session.id, object: objectPath(session.meetingId, session.id, 'recording.webm'), isAppend },
-      'Recording upload stream started/resumed');
+  if (session.lastSequence && sequence > session.lastSequence + 1) {
+    logger.warn({ sessionId: session.id, missing: sequence - session.lastSequence - 1, from: session.lastSequence + 1 },
+      'Gap in recording chunks (client dropped chunks while disconnected)');
   }
-  const writeOk = session.recordingStream.write(data);
-  if (!writeOk && session.ws && typeof session.ws.pause === 'function') {
-    session.ws.pause();
-    session.recordingStream.once('drain', () => {
-      if (session.ws && typeof session.ws.resume === 'function') {
-        session.ws.resume();
-      }
-    });
-  }
-  session.chunkCount = sequence;
+  if (!session.recordingStream) openSpoolStream(session);
+  // Local disk write — deliberately NO socket backpressure. Pausing the socket also stops it reading
+  // heartbeat pongs, which is what got recorders terminated mid-meeting.
+  session.recordingStream.write(data);
+  session.chunkCount++;
+  session.lastSequence = sequence;
   session.bytes += data.length;
-  if (sequence % 30 === 0) {
+  if (session.chunkCount % 30 === 0) {
     session.dirty.meta = true;
     scheduleFlush(session);
-    logger.debug({ sessionId: session.id, chunks: sequence, mb: (session.bytes / 1048576).toFixed(2) },
+    logger.debug({ sessionId: session.id, chunks: session.chunkCount, mb: (session.bytes / 1048576).toFixed(2) },
       'Recording progress');
   }
 }
@@ -497,7 +741,7 @@ async function finalizeAndNotify(session) {
   if (session.finalized) return;
   await finalizeSession(session, 'recording_end');
   // Tell the client where to download (only meaningful if a recording was actually written).
-  if (session.chunkCount > 0 && session.ws && session.ws.readyState === WebSocket.OPEN) {
+  if (session.state === 'ended' && session.chunkCount > 0 && session.ws && session.ws.readyState === WebSocket.OPEN) {
     try {
       const url = await storage.getRecordingSignedUrl(session.meetingId, session.id, CONFIG.signedUrlExpiresDays);
       session.ws.send(JSON.stringify({
@@ -1062,19 +1306,20 @@ wss.on('connection', (ws, req) => {
     }
   });
 
-  ws.on('close', () => {
+  ws.on('close', (code) => {
     const session = sessionByWs.get(ws);
-    logger.info({ remoteAddress, sessionId: session && session.id }, 'WS client disconnected');
+    logger.info({ remoteAddress, code, sessionId: session && session.id }, 'WS client disconnected');
     if (session) {
       sessionByWs.delete(ws);
-      session.ws = null;
-      if (session.disconnectTimer) clearTimeout(session.disconnectTimer);
-      // Wait for a disconnect grace period before finalizing so brief network flickers can reconnect.
-      session.disconnectTimer = setTimeout(() => {
-        session.disconnectTimer = null;
-        logger.info({ sessionId: session.id }, 'Disconnect grace period expired, finalizing session');
-        finalizeSession(session, 'socket_close');
-      }, CONFIG.disconnectGraceMs);
+      if (session.ws === ws) session.ws = null;
+      // During shutdown the session is persisted to the spool instead and restored on restart.
+      if (shuttingDown || session.finalized) return;
+      session.state = 'disconnected';
+      session.dirty.meta = true;
+      scheduleFlush(session);
+      // Wait for a disconnect grace period before finalizing so the recorder can reconnect and keep
+      // writing the same file.
+      armDisconnectTimer(session);
     }
   });
 
@@ -1106,12 +1351,14 @@ wss.on('close', () => clearInterval(heartbeat));
 // at most once.
 // ---------------------------------------------------------------------------
 let watchdogTimer = null;
+let uploadRetryTimer = null;
 
 async function runMissedRecordingWatchdog() {
   try {
     // Meetings with a recording open right now — the finished session only pushes at class end, so
     // treat an in-progress recording as "not missed" (avoids alerting during a long class).
-    const activeMeetingIds = new Set(recordingByMeeting.keys());
+    const activeMeetingIds = new Set(Array.from(sessions.values())
+      .filter(s => s.clientType === 'recorder').map(s => s.meetingId));
     const due = registry.dueForMissedEmail(CONFIG.missedGraceMinutes, CONFIG.missedWindowMinutes, CONFIG.missedCutoverIso, activeMeetingIds);
     for (const occ of due) {
       if (CONFIG.missedEmailsEnabled) {
@@ -1138,7 +1385,8 @@ async function runMissedRecordingWatchdog() {
 // Startup + graceful shutdown
 // ---------------------------------------------------------------------------
 async function start() {
-  logger.info({ backend: CONFIG.backend, bucket: CONFIG.bucketName, allowedDomain: CONFIG.allowedEmailDomain },
+  logger.info({ backend: CONFIG.backend, bucket: CONFIG.bucketName, allowedDomain: CONFIG.allowedEmailDomain,
+    spoolDir: CONFIG.spoolDir, disconnectGraceMs: CONFIG.disconnectGraceMs },
     'Starting GMeet Recorder server');
   if (CONFIG.selfCheck) {
     try {
@@ -1151,6 +1399,11 @@ async function start() {
     }
   }
   await registry.init();
+  await fs.promises.mkdir(CONFIG.spoolDir, { recursive: true });
+  await recoverSpooledSessions();
+  uploadRetryTimer = setInterval(() => {
+    retryPendingUploads().catch(err => logger.error({ err: err.message }, 'Upload retry sweep error'));
+  }, CONFIG.uploadRetryIntervalMs);
   watchdogTimer = setInterval(runMissedRecordingWatchdog, CONFIG.watchdogIntervalMs);
   logger.info({ graceMin: CONFIG.missedGraceMinutes, intervalMs: CONFIG.watchdogIntervalMs },
     'Missed-recording watchdog started');
@@ -1162,24 +1415,40 @@ async function start() {
 }
 
 let shuttingDown = false;
+// A restart/deploy must not split live recordings. Instead of finalizing, close each live session's
+// spool and persist its state; on startup recoverSpooledSessions() restores them and the recorders
+// (which retry every few seconds) re-attach to the same session and keep writing the same file.
+// Sessions already uploading are picked up again by recovery.
 async function shutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
-  logger.info({ signal, activeSessions: sessions.size }, 'Graceful shutdown: draining sessions');
+  logger.info({ signal, activeSessions: sessions.size }, 'Graceful shutdown: persisting live sessions to spool');
   clearInterval(heartbeat);
   if (watchdogTimer) clearInterval(watchdogTimer);
+  if (uploadRetryTimer) clearInterval(uploadRetryTimer);
+  // Hard exit if something hangs.
+  setTimeout(() => { logger.warn('Forced exit after shutdown timeout'); process.exit(0); }, 15000).unref();
+
   await registry.flush();
 
-  // Stop accepting new connections, then finalize in-flight sessions (flush GCS uploads).
+  // Stop accepting connections and drop the live ones so no chunk arrives mid-persist.
   wss.close();
-  await Promise.all(Array.from(sessions.values()).map(s => finalizeSession(s, 'shutdown')));
+  for (const client of wss.clients) { try { client.terminate(); } catch (_) { /* ignore */ } }
+
+  await Promise.all(Array.from(sessions.values()).map(async (s) => {
+    if (s.flushTimer) { clearTimeout(s.flushTimer); s.flushTimer = null; }
+    if (s.disconnectTimer) { clearTimeout(s.disconnectTimer); s.disconnectTimer = null; }
+    if (s.finalized) return; // upload in flight; state.json already says finalized -> resumed on start
+    await endRecordingStream(s);
+    s.state = 'disconnected';
+    s.dirty.meta = true;
+    await flushSession(s, { force: true });
+  }));
 
   httpServer.close(() => {
     logger.info('Server closed cleanly');
     process.exit(0);
   });
-  // Hard exit if something hangs.
-  setTimeout(() => { logger.warn('Forced exit after shutdown timeout'); process.exit(0); }, 15000).unref();
 }
 
 process.on('SIGINT', () => shutdown('SIGINT'));

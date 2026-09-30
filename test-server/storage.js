@@ -1,8 +1,8 @@
 // storage.js - Pluggable storage backend for recordings + meeting metadata.
 //
 // Two backends:
-//   - "gcs"   (default, production): streams recordings to Google Cloud Storage via resumable
-//             uploads, stores JSON artifacts as objects, and mints V4 signed download URLs.
+//   - "gcs"   (default, production): uploads finished recordings (spooled on local disk by the
+//             server) to Google Cloud Storage via resumable uploads, stores JSON artifacts as objects, and mints V4 signed download URLs.
 //   - "local" (dev/testing): mirrors the exact same layout on local disk and serves files over HTTP.
 //
 // Object / file layout (identical for both backends):
@@ -53,9 +53,13 @@ function createGcsBackend(config) {
       logger.info({ bucket: config.bucketName }, 'GCS storage backend ready (object write verified)');
     },
 
-    createRecordingWriteStream(meetingId, sessionId) {
-      const file = bucket.file(objectPath(meetingId, sessionId, 'recording.webm'));
-      return file.createWriteStream({
+    // Upload a finished recording from the server's local spool file. The server no longer streams
+    // live into GCS: a resumable upload that errors mid-meeting can't be appended to, so reopening it
+    // silently replaced everything recorded before the error. Uploading the complete file once is
+    // retryable and idempotent (same object path, full content each time).
+    async uploadRecordingFile(meetingId, sessionId, localPath) {
+      await bucket.upload(localPath, {
+        destination: objectPath(meetingId, sessionId, 'recording.webm'),
         resumable: true,
         contentType: 'video/webm',
         metadata: { contentType: 'video/webm', metadata: { meetingId, sessionId } }
@@ -137,9 +141,8 @@ function createLocalBackend(config) {
       logger.info({ root }, 'Local storage backend ready');
     },
 
-    createRecordingWriteStream(meetingId, sessionId, options = {}) {
-      const flags = options && options.append ? 'a' : 'w';
-      return fs.createWriteStream(fullPath(meetingId, sessionId, 'recording.webm'), { flags });
+    async uploadRecordingFile(meetingId, sessionId, localPath) {
+      await fs.promises.copyFile(localPath, fullPath(meetingId, sessionId, 'recording.webm'));
     },
 
     async writeJSON(meetingId, sessionId, name, obj) {
