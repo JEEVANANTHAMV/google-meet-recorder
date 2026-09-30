@@ -454,6 +454,8 @@ async function completeSession(session, reason) {
     await (session.persistChain || Promise.resolve());
     await fs.promises.rm(spoolDirFor(session.meetingId, session.id), { recursive: true, force: true })
       .catch(err => logger.warn({ err: err.message, sessionId: session.id }, 'Could not remove spool dir'));
+    // Drop the meeting folder too once its last session is gone (rmdir refuses non-empty dirs).
+    await fs.promises.rmdir(path.dirname(spoolDirFor(session.meetingId, session.id))).catch(() => {});
   } finally {
     completingSessions.delete(session.id);
   }

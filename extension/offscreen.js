@@ -542,13 +542,14 @@ const MAX_CHUNK_BYTES = 100 * 1024 * 1024;
 // startRecording waits this long for the server to accept the session before capturing anything.
 const SESSION_CONFIRM_TIMEOUT_MS = 25000;
 // Chunks kept after sending so they can be resent if the socket dies before the server stores them.
-const RESEND_HISTORY = 30;
+// Must outlast dead-link detection (PONG_TIMEOUT_MS + HEARTBEAT_MS + OS buffering): ~90 s of video.
+const RESEND_HISTORY = 90;
 // Flow control: hand the socket at most this much unsent data at a time. Dumping a whole backlog
 // (up to MAX_OUTBOX_BYTES) at once would queue heartbeat pings behind it for minutes on a slow uplink.
 const MAX_WS_BUFFERED = 2 * 1024 * 1024;
 const PUMP_RETRY_MS = 200;
 const HEARTBEAT_MS = 10000;
-const PONG_TIMEOUT_MS = 25000;
+const PONG_TIMEOUT_MS = 30000;
 const CONNECT_TIMEOUT_MS = 10000;
 const MAX_RECONNECT_DELAY_MS = 15000;
 // After Stop, keep trying to deliver queued chunks + the end marker for this long.
@@ -579,6 +580,7 @@ let startWaiter = null;        // { resolve, reject } while startRecording await
 let pumpTimer = null;
 let sockBytesQueued = 0;       // bytes handed to the current socket
 let lastDrained = 0;           // bytes the current socket had actually pushed out at the last heartbeat
+let pingMark = 0;              // sockBytesQueued right after our last ping: it has left once drained >= pingMark
 
 function buildWsUrls(configured) {
   const primary = (typeof configured === 'string' && /^wss?:\/\//.test(configured)) ? configured : LEGACY_WS_URL;
@@ -666,6 +668,7 @@ function connectWebSocket() {
       lastServerMsgAt = Date.now();
       sockBytesQueued = 0;
       lastDrained = 0;
+      pingMark = 0;
       console.log('[GMR Offscreen] WebSocket connected — authenticating', currentSessionId ? `(resume ${currentSessionId})` : '');
       // Sent directly (not via the outbox): nothing else may go out before the server knows our session.
       wsSend(JSON.stringify({
@@ -750,13 +753,14 @@ function startHeartbeat() {
   stopHeartbeat();
   heartbeatTimer = setInterval(() => {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    // While a backlog is uploading, our ping queues behind it and its pong can take longer than
-    // PONG_TIMEOUT_MS on a slow uplink. Bytes still leaving the socket prove the link is alive.
+    // While a backlog is uploading, our ping can sit in the browser's send buffer behind it, so its
+    // pong is late through no fault of the link. Excuse that only while the ping is still queued
+    // locally AND bytes are still leaving; once it has left, a missing pong means the link is dead.
     const drained = sockBytesQueued - ws.bufferedAmount;
-    if (drained > lastDrained) {
-      lastDrained = drained;
+    if (drained < pingMark && drained > lastDrained) {
       lastServerMsgAt = Math.max(lastServerMsgAt, Date.now() - HEARTBEAT_MS);
     }
+    lastDrained = drained;
     if (Date.now() - lastServerMsgAt > PONG_TIMEOUT_MS) {
       console.warn('[GMR Offscreen] No reply from server for', Math.round((Date.now() - lastServerMsgAt) / 1000), 's — treating the connection as dead');
       dropSocket();
@@ -765,6 +769,7 @@ function startHeartbeat() {
     }
     pingTime = Date.now();
     wsSend(JSON.stringify({ type: 'ping' }));
+    pingMark = sockBytesQueued;
   }, HEARTBEAT_MS);
 }
 
